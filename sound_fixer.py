@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import wave
 from datetime import datetime
 
 import numpy as np
@@ -387,6 +388,176 @@ def attenuate_impulses(signal, impulses, sample_rate, window_ms=50):
             signal[start:end] *= scale
 
     return signal
+
+
+def peak_normalize(signal):
+    """Normalize signal so that the peak amplitude is 1.0 (0 dBFS).
+    Returns the normalized signal and the gain factor applied.
+    """
+    peak = np.max(np.abs(signal))
+    if peak == 0:
+        return signal, 1.0
+    gain = 1.0 / peak
+    return signal * gain, gain
+
+
+def read_audio_as_float(filepath, temp_dir):
+    """Read an audio file and return (signal_as_float32_array, sample_rate, n_channels).
+    Uses ffmpeg to convert to 32-bit float WAV first, avoiding issues with
+    exotic formats (24-bit, high sample rates, etc.).
+    """
+    probe = run_ffprobe(filepath)
+    n_channels = 2
+    original_sr = 48000
+    for stream in probe.get("streams", []):
+        if stream.get("codec_type") == "audio":
+            n_channels = int(stream.get("channels", 2))
+            original_sr = int(stream.get("sample_rate", 48000))
+            break
+
+    float_path = os.path.join(temp_dir, "float_convert.wav")
+    cmd = [
+        "ffmpeg", "-y", "-i", filepath,
+        "-acodec", "pcm_f32le", "-ar", str(original_sr),
+        float_path,
+    ]
+    subprocess.run(cmd, capture_output=True, check=True)
+
+    with wave.open(float_path, "rb") as wf:
+        sr = wf.getframerate()
+        n_channels = wf.getnchannels()
+        n_frames = wf.getnframes()
+        raw = wf.readframes(n_frames)
+
+    samples = np.frombuffer(raw, dtype=np.float32)
+
+    if n_channels > 1:
+        samples = samples.reshape(-1, n_channels)
+
+    return samples, sr, n_channels
+
+
+def write_wav_from_float(filepath, signal, sample_rate, n_channels):
+    """Write a float32 signal array to a WAV file (32-bit float format)."""
+    signal = np.clip(signal, -1.0, 1.0).astype(np.float32)
+
+    with wave.open(filepath, "wb") as wf:
+        wf.setnchannels(n_channels)
+        wf.setsampwidth(4)
+        wf.setframerate(sample_rate)
+        wf.writeframes(signal.tobytes())
+
+
+def write_impulse_report(impulses_by_clip, output_dir):
+    """Write the impulse detection report to output_dir/impulse_report.txt."""
+    report_path = os.path.join(output_dir, "impulse_report.txt")
+    with open(report_path, "w") as f:
+        f.write("Impulse Detection Report\n")
+        f.write("=" * 70 + "\n\n")
+        f.write(f"{'Clip':<8} {'Timestamp':<12} {'Peak (dB)':<12} {'Context (dB)':<14} {'Attenuation (dB)':<18}\n")
+        f.write("-" * 70 + "\n")
+
+        for clip_name, impulses in impulses_by_clip:
+            for imp in impulses:
+                f.write(
+                    f"{clip_name:<8} "
+                    f"{imp['timestamp']:>8.3f}s   "
+                    f"{imp['peak_db']:>8.1f}    "
+                    f"{imp['context_db']:>10.1f}      "
+                    f"{imp['excess_db']:>12.1f}\n"
+                )
+
+    return report_path
+
+
+def replace_audio_for_clip(alignment, temp_dir, output_dir):
+    """Cut, clean, normalize, and mux audio for one video clip.
+    Returns (output_path, impulses_list) or (None, []) if skipped.
+    """
+    if alignment["skipped"]:
+        return None, []
+
+    video_path = alignment["video"]["path"]
+    video_duration = alignment["video"]["duration"]
+    event_path = alignment["event"]["path"]
+    offset = alignment["offset"]
+    clip_num = alignment["clip_number"]
+    basename = os.path.basename(video_path)
+
+    print(f"\n  Processing clip {clip_num}: {basename}")
+
+    # Step 1: Cut the matching audio segment from the event
+    cut_path = os.path.join(temp_dir, f"clip_{clip_num}_cut.wav")
+    cmd = [
+        "ffmpeg", "-y", "-i", event_path,
+        "-ss", str(offset), "-t", str(video_duration),
+        cut_path
+    ]
+    print(f"    Cutting audio at offset {offset:.2f}s for {video_duration:.1f}s...")
+    subprocess.run(cmd, capture_output=True, check=True)
+
+    # Step 2: Read the audio segment
+    signal, sr, nch = read_audio_as_float(cut_path, temp_dir)
+
+    # For impulse detection, work with mono
+    if nch > 1:
+        mono = signal.mean(axis=1)
+    else:
+        mono = signal
+
+    # Step 3: Detect and attenuate impulses
+    impulses = detect_impulses(mono, sr)
+
+    RED = "\033[91m"
+    RESET = "\033[0m"
+
+    if impulses:
+        for imp in impulses:
+            print(f"    {RED}IMPULSE DETECTED{RESET} at {imp['timestamp']:.3f}s — "
+                  f"peak: {imp['peak_db']:.1f} dB, context: {imp['context_db']:.1f} dB, "
+                  f"excess: {imp['excess_db']:.1f} dB")
+
+        if nch > 1:
+            for ch in range(nch):
+                signal[:, ch] = attenuate_impulses(signal[:, ch], impulses, sr)
+        else:
+            signal = attenuate_impulses(signal, impulses, sr)
+    else:
+        print(f"    No impulses detected.")
+
+    # Step 4: Peak normalize
+    if nch > 1:
+        flat = signal.flatten()
+    else:
+        flat = signal
+    flat, gain = peak_normalize(flat)
+    if nch > 1:
+        signal = flat.reshape(-1, nch)
+    else:
+        signal = flat
+    gain_db = 20 * np.log10(gain) if gain > 0 else 0
+    print(f"    Peak normalized (gain: {gain_db:+.1f} dB)")
+
+    # Step 5: Write normalized audio to temp file
+    norm_path = os.path.join(temp_dir, f"clip_{clip_num}_normalized.wav")
+    write_wav_from_float(norm_path, signal, sr, nch)
+
+    # Step 6: Mux into final video
+    output_path = os.path.join(output_dir, basename)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", norm_path,
+        "-c:v", "copy",
+        "-map", "0:v",
+        "-map", "1:a",
+        output_path,
+    ]
+    print(f"    Muxing final video to {output_path}...")
+    subprocess.run(cmd, capture_output=True, check=True)
+
+    print(f"    Done: {output_path}")
+    return output_path, impulses
 
 
 def parse_args(argv=None):
