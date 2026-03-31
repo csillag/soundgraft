@@ -1,0 +1,3 @@
+audio-offset-finder
+numpy
+tqdm
