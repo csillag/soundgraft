@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import wave
 from datetime import datetime
 
@@ -578,8 +579,92 @@ def parse_args(argv=None):
 
 def main():
     args = parse_args()
-    print(f"Input:  {args.input}")
-    print(f"Output: {args.output}")
+    input_dir = args.input
+    output_dir = args.output
+
+    if not os.path.isdir(input_dir):
+        print(f"Error: Input directory '{input_dir}' does not exist.")
+        sys.exit(1)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    YELLOW = "\033[33m"
+    RED = "\033[91m"
+    RESET = "\033[0m"
+
+    print("=" * 60)
+    print("Phase 1: Identifying files")
+    print("=" * 60)
+    audio_files, video_files, skipped = classify_files(input_dir)
+
+    print(f"  Audio files: {len(audio_files)}")
+    for a in audio_files:
+        print(f"    {os.path.basename(a['path'])} — {a['duration']:.0f}s, {a['creation_time']}")
+    print(f"  Video files: {len(video_files)}")
+    for v in video_files:
+        print(f"    {os.path.basename(v['path'])} — {v['duration']:.0f}s, {v['creation_time']}")
+    if skipped:
+        print(f"  Skipped: {len(skipped)}")
+        for s in skipped:
+            print(f"    {YELLOW}WARNING: Skipping unrecognized file: {os.path.basename(s)}{RESET}")
+
+    if not audio_files:
+        print("Error: No audio files found in input directory.")
+        sys.exit(1)
+    if not video_files:
+        print("Error: No video files found in input directory.")
+        sys.exit(1)
+
+    print(f"\n{'=' * 60}")
+    print("Phase 2: Reconstituting audio")
+    print("=" * 60)
+    events = group_audio_into_events(audio_files)
+    print(f"  Detected {len(events)} event(s)")
+
+    with tempfile.TemporaryDirectory(prefix="sound_fixer_") as temp_dir:
+        reconstituted = reconstitute_audio(events, temp_dir)
+        for i, e in enumerate(reconstituted):
+            print(f"  Event {i + 1}: {e['total_duration']:.0f}s "
+                  f"({len(e['segments'])} segment(s)), starts {e['start_time']}")
+
+        print(f"\n{'=' * 60}")
+        print("Phase 3: Aligning video clips to audio")
+        print("=" * 60)
+        alignments = align_all_clips(
+            video_files, reconstituted, temp_dir,
+            clip_filter=args.clip,
+            from_clip=args.from_clip,
+            it_is_what_it_is=args.it_is_what_it_is,
+        )
+
+        print(f"\n{'=' * 60}")
+        print("Phase 4: Replacing audio in video clips")
+        print("=" * 60)
+        impulses_by_clip = []
+
+        for alignment in alignments:
+            output_path, impulses = replace_audio_for_clip(alignment, temp_dir, output_dir)
+            if impulses:
+                clip_name = os.path.basename(alignment["video"]["path"])
+                impulses_by_clip.append((clip_name, impulses))
+
+        if impulses_by_clip:
+            report_path = write_impulse_report(impulses_by_clip, output_dir)
+            print(f"\n  {RED}Impulse report written to: {report_path}{RESET}")
+            print(f"  Review detected impulses in Audacity to verify they are genuine artifacts.")
+
+    print(f"\n{'=' * 60}")
+    print("Summary")
+    print("=" * 60)
+    processed = [a for a in alignments if not a["skipped"]]
+    skipped_clips = [a for a in alignments if a["skipped"]]
+    print(f"  Processed: {len(processed)} clip(s)")
+    print(f"  Skipped:   {len(skipped_clips)} clip(s)")
+    for s in skipped_clips:
+        print(f"    Clip {s['clip_number']}: {os.path.basename(s['video']['path'])} "
+              f"(confidence: {s['confidence']:.2f})")
+    print(f"\n  Output directory: {output_dir}")
+    print("  Done!")
 
 
 if __name__ == "__main__":
