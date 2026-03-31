@@ -8,6 +8,8 @@ import subprocess
 import sys
 from datetime import datetime
 
+import numpy as np
+
 from tqdm import tqdm
 from audio_offset_finder.audio_offset_finder import find_offset_between_files
 
@@ -328,6 +330,63 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
         })
 
     return alignments
+
+
+def detect_impulses(signal, sample_rate, window_ms=50, context_ms=500, threshold_db=15):
+    window_samples = int(sample_rate * window_ms / 1000)
+    context_windows = int(context_ms / window_ms)
+
+    num_windows = len(signal) // window_samples
+    if num_windows == 0:
+        return []
+
+    trimmed = signal[:num_windows * window_samples]
+    windows = np.abs(trimmed.reshape(num_windows, window_samples))
+    peaks = windows.max(axis=1)
+
+    peaks_safe = np.maximum(peaks, 1e-10)
+    peaks_db = 20 * np.log10(peaks_safe)
+
+    impulses = []
+
+    for i in range(num_windows):
+        ctx_start = max(0, i - context_windows)
+        ctx_end = min(num_windows, i + context_windows + 1)
+        context_indices = list(range(ctx_start, i)) + list(range(i + 1, ctx_end))
+
+        if not context_indices:
+            continue
+
+        context_avg_db = np.mean(peaks_db[context_indices])
+        excess = peaks_db[i] - context_avg_db
+
+        if excess > threshold_db:
+            impulses.append({
+                "timestamp": i * window_ms / 1000,
+                "window_idx": i,
+                "peak_db": float(peaks_db[i]),
+                "context_db": float(context_avg_db),
+                "excess_db": float(excess),
+            })
+
+    return impulses
+
+
+def attenuate_impulses(signal, impulses, sample_rate, window_ms=50):
+    window_samples = int(sample_rate * window_ms / 1000)
+
+    for imp in impulses:
+        idx = imp["window_idx"]
+        start = idx * window_samples
+        end = start + window_samples
+
+        current_peak = np.max(np.abs(signal[start:end]))
+        if current_peak > 0:
+            target_peak = 10 ** (imp["context_db"] / 20)
+            scale = target_peak / current_peak
+            signal[start:end] *= scale
+
+    return signal
 
 
 def parse_args(argv=None):
