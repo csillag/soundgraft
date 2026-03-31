@@ -85,6 +85,75 @@ def classify_files(input_dir):
     return audio_files, video_files, skipped_files
 
 
+def group_audio_into_events(audio_files):
+    """Group sorted audio files into events using the 98% size heuristic.
+
+    A 'short' segment followed by a 'full' segment marks an event boundary.
+    Returns a list of events, each event being a list of file metadata dicts.
+    """
+    if not audio_files:
+        return []
+
+    max_size = max(f["size"] for f in audio_files)
+    full_threshold = max_size * 0.98
+
+    events = []
+    current_event = []
+
+    for i, f in enumerate(audio_files):
+        current_event.append(f)
+        is_last = i == len(audio_files) - 1
+        is_short = f["size"] < full_threshold
+
+        if is_short and not is_last:
+            # Short segment — check if next is full (= new event)
+            next_is_full = audio_files[i + 1]["size"] >= full_threshold
+            if next_is_full:
+                events.append(current_event)
+                current_event = []
+
+    if current_event:
+        events.append(current_event)
+
+    return events
+
+
+def reconstitute_audio(events, temp_dir):
+    """Concatenate audio segments for each event using sox.
+
+    Returns a list of dicts, one per event:
+      {
+        "path": path to the concatenated WAV (or original if single segment),
+        "segments": list of original file metadata dicts,
+        "start_time": creation_time of the first segment,
+        "total_duration": sum of segment durations,
+      }
+    """
+    result = []
+
+    for i, segments in enumerate(events):
+        total_duration = sum(s["duration"] for s in segments)
+        start_time = segments[0]["creation_time"]
+
+        if len(segments) == 1:
+            event_path = segments[0]["path"]
+        else:
+            event_path = os.path.join(temp_dir, f"event_{i + 1}.wav")
+            input_paths = [s["path"] for s in segments]
+            cmd = ["sox"] + input_paths + [event_path]
+            print(f"  Concatenating {len(segments)} segments into {os.path.basename(event_path)}...")
+            subprocess.run(cmd, check=True)
+
+        result.append({
+            "path": event_path,
+            "segments": segments,
+            "start_time": start_time,
+            "total_duration": total_duration,
+        })
+
+    return result
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Replace video clip audio with matched segments from a dedicated audio recording."
