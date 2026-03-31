@@ -20,6 +20,10 @@ from audio_offset_finder.audio_offset_finder import find_offset_between_files
 # Scores < 5 are unlikely correct. We use 8 as a reasonable middle ground.
 CONFIDENCE_THRESHOLD = 8
 
+RED = "\033[91m"
+YELLOW = "\033[33m"
+RESET = "\033[0m"
+
 
 AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".ogg", ".aac"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".mts"}
@@ -487,6 +491,11 @@ def replace_audio_for_clip(alignment, temp_dir, output_dir):
 
     print(f"\n  Processing clip {clip_num}: {basename}")
 
+    if offset < 0:
+        print(f"    {YELLOW}WARNING: Negative offset ({offset:.2f}s) — "
+              f"video may start before the audio recording. Clamping to 0.{RESET}")
+        offset = 0
+
     # Step 1: Cut the matching audio segment from the event
     cut_path = os.path.join(temp_dir, f"clip_{clip_num}_cut.wav")
     cmd = [
@@ -508,9 +517,6 @@ def replace_audio_for_clip(alignment, temp_dir, output_dir):
 
     # Step 3: Detect and attenuate impulses
     impulses = detect_impulses(mono, sr)
-
-    RED = "\033[91m"
-    RESET = "\033[0m"
 
     if impulses:
         for imp in impulses:
@@ -587,10 +593,6 @@ def main():
         sys.exit(1)
 
     os.makedirs(output_dir, exist_ok=True)
-
-    YELLOW = "\033[33m"
-    RED = "\033[91m"
-    RESET = "\033[0m"
 
     print("=" * 60)
     print("Phase 1: Identifying files")
