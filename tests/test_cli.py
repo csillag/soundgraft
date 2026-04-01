@@ -4,7 +4,7 @@ import sys
 
 def test_help_flag():
     result = subprocess.run(
-        [sys.executable, "sound_fixer.py", "--help"],
+        [sys.executable, "-m", "soundgraft.cli", "--help"],
         capture_output=True, text=True
     )
     assert result.returncode == 0
@@ -17,7 +17,7 @@ def test_help_flag():
 
 def test_missing_required_args():
     result = subprocess.run(
-        [sys.executable, "sound_fixer.py"],
+        [sys.executable, "-m", "soundgraft.cli"],
         capture_output=True, text=True
     )
     assert result.returncode != 0

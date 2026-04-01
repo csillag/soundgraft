@@ -1,5 +1,5 @@
 import numpy as np
-from sound_fixer import detect_impulses, attenuate_impulses
+from soundgraft.cli import detect_impulses, attenuate_impulses
 
 
 def test_no_impulse_in_steady_signal():

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sound Fixer — replace video audio with high-quality dedicated recordings."""
+"""SoundGraft — replace video audio with high-quality dedicated recordings."""
 
 import argparse
 import json
@@ -164,39 +164,25 @@ def group_audio_into_events(audio_files):
     return events
 
 
-def reconstitute_audio(events, temp_dir):
-    """Concatenate audio segments for each event using sox.
+def build_event_metadata(events):
+    """Build event metadata from grouped segments (no concatenation needed).
 
     Returns a list of dicts, one per event:
       {
-        "path": path to the concatenated WAV (or original if single segment),
         "segments": list of original file metadata dicts,
         "start_time": creation_time of the first segment,
         "total_duration": sum of segment durations,
       }
     """
     result = []
-
-    for i, segments in enumerate(events):
+    for segments in events:
         total_duration = sum(s["duration"] for s in segments)
         start_time = segments[0]["creation_time"]
-
-        if len(segments) == 1:
-            event_path = segments[0]["path"]
-        else:
-            event_path = os.path.join(temp_dir, f"event_{i + 1}.wav")
-            input_paths = [s["path"] for s in segments]
-            cmd = ["sox"] + input_paths + [event_path]
-            print(f"  Concatenating {len(segments)} segments into {os.path.basename(event_path)}...")
-            subprocess.run(cmd, check=True)
-
         result.append({
-            "path": event_path,
             "segments": segments,
             "start_time": start_time,
             "total_duration": total_duration,
         })
-
     return result
 
 
@@ -233,7 +219,10 @@ def get_fingerprint(filepath):
     Returns a list of 32-bit integers.
     """
     cmd = ["fpcalc", "-raw", "-length", "0", filepath]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"    {RED}fpcalc failed (exit {result.returncode}): {result.stderr.strip()}{RESET}")
+        return []
     for line in result.stdout.strip().split("\n"):
         if line.startswith("FINGERPRINT="):
             return [int(x) for x in line.split("=", 1)[1].split(",")]
@@ -285,22 +274,46 @@ def correlate_fingerprints(fp_ref, fp_clip, search_start=0, search_end=None):
     return best_offset, best_score
 
 
-def align_clip_to_event(video_path, event, video_meta, temp_dir, no_hint=False):
+def fingerprint_events(events):
+    """Fingerprint all events upfront. Returns a list of fingerprint arrays, one per event."""
+    event_fingerprints = []
+    total_segments = sum(len(e["segments"]) for e in events)
+
+    print(f"  Fingerprinting {total_segments} audio segment(s) across {len(events)} event(s)...")
+    with tqdm(total=total_segments, desc="  Fingerprinting",
+              bar_format="{desc}: {n}/{total} [{elapsed}]") as pbar:
+        for event in events:
+            fp = []
+            for seg in event["segments"]:
+                fp_seg = get_fingerprint(seg["path"])
+                if not fp_seg:
+                    print(f"  {RED}ERROR: Could not fingerprint {os.path.basename(seg['path'])}{RESET}")
+                    fp = []
+                    break
+                fp.extend(fp_seg)
+                pbar.update(1)
+            event_fingerprints.append(fp)
+
+    for i, fp in enumerate(event_fingerprints):
+        if fp:
+            print(f"  Event {i + 1}: {len(fp)} fingerprint items ({len(fp) * FPCALC_ITEM_DURATION:.0f}s)")
+        else:
+            print(f"  Event {i + 1}: {RED}fingerprinting failed{RESET}")
+
+    return event_fingerprints
+
+
+def align_clip_to_event(video_path, event, fp_ref, video_meta, no_hint=False):
     """Align a video clip to an event using chromaprint fingerprint correlation.
 
-    First tries a metadata-hinted narrow search, then falls back to full scan.
+    fp_ref is the pre-computed fingerprint for the event.
     Returns (offset_seconds, confidence_score) or (None, 0) on failure.
     """
-    event_path = event["path"]
     video_time = parse_timestamp(video_meta["creation_time"])
     event_start = parse_timestamp(event["start_time"])
 
-    print(f"    Generating fingerprints...")
-    with tqdm(total=2, desc="    Fingerprinting", bar_format="{desc}: {n}/{total} [{elapsed}]") as pbar:
-        fp_ref = get_fingerprint(event_path)
-        pbar.update(1)
-        fp_clip = get_fingerprint(video_path)
-        pbar.update(1)
+    print(f"    Fingerprinting clip...")
+    fp_clip = get_fingerprint(video_path)
 
     if not fp_ref or not fp_clip:
         print(f"    {RED}ERROR: Could not generate fingerprints{RESET}")
@@ -342,18 +355,10 @@ def align_clip_to_event(video_path, event, video_meta, temp_dir, no_hint=False):
 
 
 def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=None, it_is_what_it_is=False, no_hint=False):
-    """Align video clips to events. Returns list of alignment results.
+    """Align video clips to events. Returns list of alignment results."""
+    # Fingerprint all events once upfront
+    event_fingerprints = fingerprint_events(events)
 
-    Each result is a dict:
-      {
-        "video": video file metadata,
-        "clip_number": 1-indexed clip number,
-        "event": matched event dict,
-        "offset": offset in seconds within the event audio,
-        "confidence": confidence score,
-        "skipped": True if low confidence and not --it-is-what-it-is,
-      }
-    """
     alignments = []
 
     for i, video in enumerate(video_files):
@@ -373,8 +378,11 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
         best_event = None
 
         for j, event in enumerate(events):
+            fp_ref = event_fingerprints[j]
+            if not fp_ref:
+                continue
             print(f"    Trying event {j + 1} ({event['total_duration']:.0f}s)...")
-            offset, score = align_clip_to_event(video["path"], event, video, temp_dir, no_hint=no_hint)
+            offset, score = align_clip_to_event(video["path"], event, fp_ref, video, no_hint=no_hint)
             if score > best_score:
                 best_offset = offset
                 best_score = score
@@ -492,6 +500,10 @@ def detect_applause(signal, sample_rate):
     # Compute spectral flatness in windows
     n_fft = int(analysis_sr * APPLAUSE_WINDOW_SEC)
     hop_length = n_fft  # non-overlapping windows
+
+    if len(analysis_signal) < n_fft:
+        return []
+
     flatness = librosa.feature.spectral_flatness(
         y=analysis_signal, n_fft=n_fft, hop_length=hop_length
     )[0]
@@ -608,6 +620,8 @@ def peak_normalize(signal):
     """Normalize signal so that the peak amplitude is 1.0 (0 dBFS).
     Returns the normalized signal and the gain factor applied.
     """
+    if len(signal) == 0:
+        return signal, 1.0
     peak = np.max(np.abs(signal))
     if peak == 0:
         return signal, 1.0
@@ -663,29 +677,26 @@ def write_wav_from_float(filepath, signal, sample_rate, n_channels):
         wf.writeframes(int_signal.tobytes())
 
 
-def write_impulse_report(impulses_by_clip, output_dir):
-    """Write the impulse detection report to output_dir/impulse_report.txt."""
-    report_path = os.path.join(output_dir, "impulse_report.txt")
-    with open(report_path, "w") as f:
-        f.write("Impulse Detection Report\n")
-        f.write("=" * 70 + "\n\n")
-        f.write(f"{'Clip':<8} {'Timestamp':<12} {'Peak (dB)':<12} {'Context (dB)':<14} {'Attenuation (dB)':<18}\n")
-        f.write("-" * 70 + "\n")
 
-        for clip_name, impulses in impulses_by_clip:
-            for imp in impulses:
-                f.write(
-                    f"{clip_name:<8} "
-                    f"{imp['timestamp']:>8.3f}s   "
-                    f"{imp['peak_db']:>8.1f}    "
-                    f"{imp['context_db']:>10.1f}      "
-                    f"{imp['excess_db']:>12.1f}\n"
-                )
+class ClipLogger:
+    """Log to both console and a per-clip log file."""
 
-    return report_path
+    def __init__(self, log_path):
+        self.log_file = open(log_path, "w")
+
+    def log(self, msg, console_msg=None):
+        """Write msg to log file (without ANSI codes) and console_msg (or msg) to console."""
+        # Strip ANSI codes for the log file
+        import re
+        clean = re.sub(r'\033\[[0-9;]*m', '', msg)
+        self.log_file.write(clean + "\n")
+        print(console_msg if console_msg is not None else msg)
+
+    def close(self):
+        self.log_file.close()
 
 
-def process_audio_for_clip(alignment, temp_dir):
+def process_audio_for_clip(alignment, temp_dir, output_dir):
     """Phase 4: Cut, detect applause, attenuate impulses, peak normalize.
 
     Returns (normalized_wav_path, applause_blocks, impulses) or (None, [], []) if skipped.
@@ -694,27 +705,66 @@ def process_audio_for_clip(alignment, temp_dir):
         return None, [], []
 
     video_duration = alignment["video"]["duration"]
-    event_path = alignment["event"]["path"]
     offset = alignment["offset"]
     clip_num = alignment["clip_number"]
     basename = os.path.basename(alignment["video"]["path"])
+    log_name = os.path.splitext(basename)[0] + ".log"
+    logger = ClipLogger(os.path.join(output_dir, log_name))
 
     print(f"\n  Clip {clip_num}: {basename}")
 
+    logger.log(f"    Match found at offset {offset:.2f}s, confidence: {alignment['confidence']:.4f}")
+
     if offset < 0:
-        print(f"    {YELLOW}WARNING: Negative offset ({offset:.2f}s) — "
-              f"video may start before the audio recording. Clamping to 0.{RESET}")
+        logger.log(f"    {YELLOW}WARNING: Negative offset ({offset:.2f}s) — "
+                   f"video may start before the audio recording. Clamping to 0.{RESET}")
         offset = 0
 
-    # Step 1: Cut the matching audio segment from the event
+    # Step 1: Cut the matching audio segment from the event.
+    # We cut from individual segments to avoid >4GB WAV file issues.
     cut_path = os.path.join(temp_dir, f"clip_{clip_num}_cut.wav")
-    cmd = [
-        "ffmpeg", "-y", "-i", event_path,
-        "-ss", str(offset), "-t", str(video_duration),
-        cut_path
-    ]
-    print(f"    Cutting audio at offset {offset:.2f}s for {video_duration:.1f}s...")
-    subprocess.run(cmd, capture_output=True, check=True)
+    segments = alignment["event"]["segments"]
+    logger.log(f"    Cutting audio at offset {offset:.2f}s for {video_duration:.1f}s...")
+
+    # Find which segment(s) the offset falls into
+    remaining_offset = offset
+    remaining_duration = video_duration
+    cut_parts = []
+    part_idx = 0
+
+    for seg in segments:
+        if remaining_duration <= 0:
+            break
+        seg_dur = seg["duration"]
+        if remaining_offset >= seg_dur:
+            remaining_offset -= seg_dur
+            continue
+        # This segment contains (part of) the audio we need
+        take_duration = min(remaining_duration, seg_dur - remaining_offset)
+        part_path = os.path.join(temp_dir, f"clip_{clip_num}_part_{part_idx}.wav")
+        cmd = [
+            "ffmpeg", "-y", "-i", seg["path"],
+            "-ss", str(remaining_offset), "-t", str(take_duration),
+            part_path
+        ]
+        subprocess.run(cmd, capture_output=True, check=True)
+        cut_parts.append(part_path)
+        remaining_duration -= take_duration
+        remaining_offset = 0
+        part_idx += 1
+
+    if len(cut_parts) == 0:
+        logger.log(f"    {RED}ERROR: Offset {offset:.2f}s is beyond the event audio{RESET}")
+        logger.close()
+        return None, [], []
+    elif len(cut_parts) == 1:
+        os.rename(cut_parts[0], cut_path)
+    else:
+        # Concatenate parts with sox
+        cmd = ["sox"] + cut_parts + [cut_path]
+        subprocess.run(cmd, check=True)
+        for p in cut_parts:
+            os.remove(p)
 
     # Step 2: Read the audio segment
     signal, sr, nch = read_audio_as_float(cut_path, temp_dir)
@@ -729,17 +779,17 @@ def process_audio_for_clip(alignment, temp_dir):
     applause_blocks = detect_applause(mono, sr)
 
     if applause_blocks:
-        print(f"    Applause detected:")
+        logger.log(f"    Applause detected:")
         for start, end in applause_blocks:
-            print(f"      {RED}APPLAUSE{RESET} {start:.1f}s - {end:.1f}s ({end - start:.1f}s)")
+            logger.log(f"      {RED}APPLAUSE{RESET} {start:.1f}s - {end:.1f}s ({end - start:.1f}s)")
         if nch > 1:
             for ch in range(nch):
                 signal[:, ch] = attenuate_applause(signal[:, ch], sr, applause_blocks)
         else:
             signal = attenuate_applause(signal, sr, applause_blocks)
-        print(f"    Applause attenuated to match music level.")
+        logger.log(f"    Applause attenuated to match music level.")
     else:
-        print(f"    No applause detected.")
+        logger.log(f"    No applause detected.")
 
     # Recompute mono after applause attenuation
     if nch > 1:
@@ -752,16 +802,16 @@ def process_audio_for_clip(alignment, temp_dir):
 
     if impulses:
         for imp in impulses:
-            print(f"      {RED}IMPULSE{RESET} at {imp['timestamp']:.3f}s — "
-                  f"peak: {imp['peak_db']:.1f} dB, context: {imp['context_db']:.1f} dB, "
-                  f"excess: {imp['excess_db']:.1f} dB")
+            logger.log(f"      {RED}IMPULSE{RESET} at {imp['timestamp']:.3f}s — "
+                       f"peak: {imp['peak_db']:.1f} dB, context: {imp['context_db']:.1f} dB, "
+                       f"excess: {imp['excess_db']:.1f} dB")
         if nch > 1:
             for ch in range(nch):
                 signal[:, ch] = attenuate_impulses(signal[:, ch], impulses, sr)
         else:
             signal = attenuate_impulses(signal, impulses, sr)
     else:
-        print(f"    No impulses detected.")
+        logger.log(f"    No impulses detected.")
 
     # Step 5: Peak normalize
     if nch > 1:
@@ -774,12 +824,13 @@ def process_audio_for_clip(alignment, temp_dir):
     else:
         signal = flat
     gain_db = 20 * np.log10(gain) if gain > 0 else 0
-    print(f"    Peak normalized (gain: {gain_db:+.1f} dB)")
+    logger.log(f"    Peak normalized (gain: {gain_db:+.1f} dB)")
 
     # Step 6: Write normalized audio to temp file
     norm_path = os.path.join(temp_dir, f"clip_{clip_num}_normalized.wav")
     write_wav_from_float(norm_path, signal, sr, nch)
 
+    logger.close()
     return norm_path, applause_blocks, impulses
 
 
@@ -862,20 +913,19 @@ def main():
         sys.exit(1)
 
     print(f"\n{'=' * 60}")
-    print("Phase 2: Reconstituting audio")
+    print("Phase 2: Grouping audio segments")
     print("=" * 60)
     events = group_audio_into_events(audio_files)
-    print(f"  Detected {len(events)} event(s)")
+    reconstituted = build_event_metadata(events)
+    print(f"  Detected {len(reconstituted)} event(s)")
+    for i, e in enumerate(reconstituted):
+        print(f"  Event {i + 1}: {e['total_duration']:.0f}s "
+              f"({len(e['segments'])} segment(s)), starts {e['start_time']}")
 
     if args.temp_dir:
         os.makedirs(args.temp_dir, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="sound_fixer_", dir=args.temp_dir) as temp_dir:
-        reconstituted = reconstitute_audio(events, temp_dir)
-        for i, e in enumerate(reconstituted):
-            print(f"  Event {i + 1}: {e['total_duration']:.0f}s "
-                  f"({len(e['segments'])} segment(s)), starts {e['start_time']}")
-
         print(f"\n{'=' * 60}")
         print("Phase 3: Aligning video clips to audio")
         print("=" * 60)
@@ -892,21 +942,12 @@ def main():
         print("Phase 4: Processing audio")
         print("=" * 60)
         clip_results = []
-        impulses_by_clip = []
 
         for alignment in alignments:
             norm_path, applause_blocks, impulses = process_audio_for_clip(
-                alignment, temp_dir,
+                alignment, temp_dir, output_dir,
             )
             clip_results.append((alignment, norm_path))
-            if impulses:
-                clip_name = os.path.basename(alignment["video"]["path"])
-                impulses_by_clip.append((clip_name, impulses))
-
-        if impulses_by_clip:
-            report_path = write_impulse_report(impulses_by_clip, output_dir)
-            print(f"\n  {RED}Impulse report written to: {report_path}{RESET}")
-            print(f"  Review detected impulses in Audacity to verify they are genuine artifacts.")
 
         # Phase 5: Mux final videos
         print(f"\n{'=' * 60}")

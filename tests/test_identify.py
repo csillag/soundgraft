@@ -2,7 +2,7 @@ import os
 import tempfile
 from unittest.mock import patch
 
-from sound_fixer import classify_files
+from soundgraft.cli import classify_files
 
 
 def _touch(path):

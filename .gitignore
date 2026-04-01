@@ -4,4 +4,6 @@ __pycache__/
 test-input/
 test-output/
 *.egg-info/
+dist/
+build/
 .superpowers-session.json

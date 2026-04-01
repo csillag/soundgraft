@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68.0", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "soundgraft"
+version = "0.1.0"
+description = "Replace video audio with high-quality dedicated recordings"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "tqdm",
+    "librosa",
+]
+
+[project.scripts]
+soundgraft = "soundgraft.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/csillag/soundgraft"
+
+[tool.setuptools.packages.find]
+where = ["src"]

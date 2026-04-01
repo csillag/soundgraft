@@ -1,4 +1,4 @@
-from sound_fixer import group_audio_into_events
+from soundgraft.cli import group_audio_into_events
 
 
 def _file(name, size, creation_time):
