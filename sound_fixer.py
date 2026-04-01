@@ -4,21 +4,50 @@
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import wave
 from datetime import datetime
 
+
+def check_dependencies():
+    """Check that all required dependencies are available."""
+    missing_python = []
+    missing_system = []
+
+    for module, pip_name in [("numpy", "numpy"), ("tqdm", "tqdm"), ("librosa", "librosa")]:
+        try:
+            __import__(module)
+        except ImportError:
+            missing_python.append(pip_name)
+
+    for cmd, pkg_hint in [("ffmpeg", "ffmpeg"), ("ffprobe", "ffmpeg"), ("sox", "sox"), ("fpcalc", "libchromaprint-tools")]:
+        if shutil.which(cmd) is None:
+            missing_system.append((cmd, pkg_hint))
+
+    if missing_python or missing_system:
+        print("Missing dependencies:\n")
+        if missing_python:
+            print(f"  Python packages:  pip install {' '.join(missing_python)}")
+        for cmd, pkg in missing_system:
+            print(f"  System tool '{cmd}':  sudo apt install {pkg}")
+        print()
+        sys.exit(1)
+
+
+check_dependencies()
+
 import numpy as np
 
 from tqdm import tqdm
-from audio_offset_finder.audio_offset_finder import find_offset_between_files
 
 
-# Confidence threshold: scores >= 10 are likely correct per audio-offset-finder docs.
-# Scores < 5 are unlikely correct. We use 8 as a reasonable middle ground.
-CONFIDENCE_THRESHOLD = 8
+# Confidence threshold for chromaprint correlation (0.0-1.0).
+# Scores are bit-match ratios: 0.5 = random chance, higher = better match.
+# For different-device recordings of the same event, 0.3+ is a good match.
+CONFIDENCE_THRESHOLD = 0.25
 
 RED = "\033[91m"
 YELLOW = "\033[33m"
@@ -194,21 +223,70 @@ def timestamps_look_plausible(video_time, event_start_time):
     return video_time.date() == event_start_time.date()
 
 
-def extract_video_audio(video_path, temp_dir):
-    """Extract audio from a video file to a temp WAV. Returns path to WAV."""
-    base = os.path.splitext(os.path.basename(video_path))[0]
-    wav_path = os.path.join(temp_dir, f"{base}_audio.wav")
-    cmd = [
-        "ffmpeg", "-y", "-i", video_path,
-        "-vn", "-acodec", "pcm_s16le", "-ar", "8000", "-ac", "1",
-        wav_path
-    ]
-    subprocess.run(cmd, capture_output=True, check=True)
-    return wav_path
+FPCALC_ITEM_DURATION = 0.1238  # seconds per fingerprint item (4096 / 11025 / 3)
+ALIGNMENT_OFFSET_CORRECTION = 0.5  # empirical correction for chromaprint alignment bias
 
 
-def align_clip_to_event(video_wav, event, video_meta, temp_dir):
-    """Try to align a video clip's audio to an event's audio.
+def get_fingerprint(filepath):
+    """Get raw chromaprint fingerprint for an audio file using fpcalc.
+
+    Returns a list of 32-bit integers.
+    """
+    cmd = ["fpcalc", "-raw", "-length", "0", filepath]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    for line in result.stdout.strip().split("\n"):
+        if line.startswith("FINGERPRINT="):
+            return [int(x) for x in line.split("=", 1)[1].split(",")]
+    return []
+
+
+def popcnt(x):
+    """Count the number of set bits in a 32-bit integer."""
+    return bin(x & 0xFFFFFFFF).count("1")
+
+
+def correlate_fingerprints(fp_ref, fp_clip, search_start=0, search_end=None):
+    """Slide fp_clip over fp_ref and find the offset with highest correlation.
+
+    Returns (best_offset_items, best_score) where best_offset_items is the
+    position in fp_ref where fp_clip best matches, and best_score is 0.0-1.0.
+    """
+    clip_len = len(fp_clip)
+    ref_len = len(fp_ref)
+
+    if clip_len == 0 or ref_len == 0:
+        return 0, 0.0
+
+    if search_end is None:
+        search_end = ref_len - clip_len
+
+    search_end = min(search_end, ref_len - clip_len)
+    search_start = max(0, search_start)
+
+    if search_start >= search_end:
+        return 0, 0.0
+
+    best_offset = 0
+    best_score = 0.0
+    total_positions = search_end - search_start
+
+    for offset in tqdm(range(search_start, search_end),
+                       desc="    Aligning", unit="pos",
+                       bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
+        bit_errors = 0
+        total_bits = 32 * clip_len
+        for i in range(clip_len):
+            bit_errors += popcnt(fp_ref[offset + i] ^ fp_clip[i])
+        score = 1.0 - (bit_errors / total_bits)
+        if score > best_score:
+            best_score = score
+            best_offset = offset
+
+    return best_offset, best_score
+
+
+def align_clip_to_event(video_path, event, video_meta, temp_dir, no_hint=False):
+    """Align a video clip to an event using chromaprint fingerprint correlation.
 
     First tries a metadata-hinted narrow search, then falls back to full scan.
     Returns (offset_seconds, confidence_score) or (None, 0) on failure.
@@ -217,68 +295,53 @@ def align_clip_to_event(video_wav, event, video_meta, temp_dir):
     video_time = parse_timestamp(video_meta["creation_time"])
     event_start = parse_timestamp(event["start_time"])
 
+    print(f"    Generating fingerprints...")
+    with tqdm(total=2, desc="    Fingerprinting", bar_format="{desc}: {n}/{total} [{elapsed}]") as pbar:
+        fp_ref = get_fingerprint(event_path)
+        pbar.update(1)
+        fp_clip = get_fingerprint(video_path)
+        pbar.update(1)
+
+    if not fp_ref or not fp_clip:
+        print(f"    {RED}ERROR: Could not generate fingerprints{RESET}")
+        return None, 0
+
+    print(f"    Reference: {len(fp_ref)} items ({len(fp_ref) * FPCALC_ITEM_DURATION:.0f}s), "
+          f"Clip: {len(fp_clip)} items ({len(fp_clip) * FPCALC_ITEM_DURATION:.0f}s)")
+
     # Try metadata-hinted search first
-    if timestamps_look_plausible(video_time, event_start):
+    if not no_hint and timestamps_look_plausible(video_time, event_start):
         offset_hint = (video_time - event_start).total_seconds()
         # Search window: +/- 30 minutes around expected position
-        trim_start = max(0, offset_hint - 1800)
-        trim_end = offset_hint + 1800 + video_meta["duration"]
+        hint_start = int(max(0, offset_hint - 1800) / FPCALC_ITEM_DURATION)
+        hint_end = int((offset_hint + 1800 + video_meta["duration"]) / FPCALC_ITEM_DURATION)
 
         print(f"    Trying metadata-hinted window "
-              f"({trim_start:.0f}s - {trim_end:.0f}s of event audio)...")
+              f"({hint_start * FPCALC_ITEM_DURATION:.0f}s - {hint_end * FPCALC_ITEM_DURATION:.0f}s)...")
 
-        # audio-offset-finder's trim parameter trims from the start, so we need
-        # to create a trimmed version of the event audio for the windowed search
-        trimmed_path = os.path.join(temp_dir, "trimmed_event.wav")
-        cmd = [
-            "ffmpeg", "-y", "-i", event_path,
-            "-ss", str(trim_start), "-t", str(trim_end - trim_start),
-            "-acodec", "pcm_s16le", "-ar", "8000", "-ac", "1",
-            trimmed_path
-        ]
-        subprocess.run(cmd, capture_output=True, check=True)
-
-        print(f"    Aligning (narrow search)...")
-        for _ in tqdm(range(1), desc="    Narrow alignment", bar_format="{desc}: {bar} {elapsed}"):
-            results = find_offset_between_files(trimmed_path, video_wav)
-
-        score = results.get("standard_score", 0)
-        offset = results.get("time_offset", 0)
+        offset_items, score = correlate_fingerprints(fp_ref, fp_clip, hint_start, hint_end)
+        offset_secs = offset_items * FPCALC_ITEM_DURATION + ALIGNMENT_OFFSET_CORRECTION + ALIGNMENT_OFFSET_CORRECTION
 
         if score >= CONFIDENCE_THRESHOLD:
-            # Offset is relative to the trimmed audio — add back the trim start
-            actual_offset = offset + trim_start
-            print(f"    Match found! Offset: {actual_offset:.2f}s, confidence: {score:.2f}")
-            return actual_offset, score
+            print(f"    Match found! Offset: {offset_secs:.2f}s, confidence: {score:.4f}")
+            return offset_secs, score
         else:
-            print(f"    Narrow search inconclusive (score: {score:.2f}), falling back to full scan...")
+            print(f"    Narrow search inconclusive (score: {score:.4f}), falling back to full scan...")
 
-    # Full scan fallback
-    print(f"    Aligning (full scan of {event['total_duration']:.0f}s event audio)...")
-    # Convert full event audio to the format audio-offset-finder expects
-    full_path = os.path.join(temp_dir, "full_event_8k.wav")
-    cmd = [
-        "ffmpeg", "-y", "-i", event_path,
-        "-acodec", "pcm_s16le", "-ar", "8000", "-ac", "1",
-        full_path
-    ]
-    subprocess.run(cmd, capture_output=True, check=True)
-
-    for _ in tqdm(range(1), desc="    Full alignment", bar_format="{desc}: {bar} {elapsed}"):
-        results = find_offset_between_files(full_path, video_wav)
-
-    score = results.get("standard_score", 0)
-    offset = results.get("time_offset", 0)
+    # Full scan
+    print(f"    Full scan of {len(fp_ref) * FPCALC_ITEM_DURATION:.0f}s event audio...")
+    offset_items, score = correlate_fingerprints(fp_ref, fp_clip)
+    offset_secs = offset_items * FPCALC_ITEM_DURATION + ALIGNMENT_OFFSET_CORRECTION
 
     if score >= CONFIDENCE_THRESHOLD:
-        print(f"    Match found! Offset: {offset:.2f}s, confidence: {score:.2f}")
+        print(f"    Match found! Offset: {offset_secs:.2f}s, confidence: {score:.4f}")
     else:
-        print(f"    Low confidence match. Offset: {offset:.2f}s, confidence: {score:.2f}")
+        print(f"    Low confidence match. Offset: {offset_secs:.2f}s, confidence: {score:.4f}")
 
-    return offset, score
+    return offset_secs, score
 
 
-def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=None, it_is_what_it_is=False):
+def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=None, it_is_what_it_is=False, no_hint=False):
     """Align video clips to events. Returns list of alignment results.
 
     Each result is a dict:
@@ -304,9 +367,6 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
 
         print(f"\n  Clip {clip_num}: {os.path.basename(video['path'])} ({video['duration']:.1f}s)")
 
-        # Extract audio from video
-        video_wav = extract_video_audio(video["path"], temp_dir)
-
         # Try each event, pick best match
         best_offset = None
         best_score = 0
@@ -314,7 +374,7 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
 
         for j, event in enumerate(events):
             print(f"    Trying event {j + 1} ({event['total_duration']:.0f}s)...")
-            offset, score = align_clip_to_event(video_wav, event, video, temp_dir)
+            offset, score = align_clip_to_event(video["path"], event, video, temp_dir, no_hint=no_hint)
             if score > best_score:
                 best_offset = offset
                 best_score = score
@@ -338,7 +398,8 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
     return alignments
 
 
-def detect_impulses(signal, sample_rate, window_ms=50, context_ms=500, threshold_db=15):
+def detect_impulses(signal, sample_rate, window_ms=50, context_ms=500, threshold_db=15, exclude_regions=None):
+    """Detect impulse events. exclude_regions is a list of (start_sec, end_sec) to skip."""
     window_samples = int(sample_rate * window_ms / 1000)
     context_windows = int(context_ms / window_ms)
 
@@ -356,6 +417,18 @@ def detect_impulses(signal, sample_rate, window_ms=50, context_ms=500, threshold
     impulses = []
 
     for i in range(num_windows):
+        timestamp = i * window_ms / 1000
+
+        # Skip windows inside excluded regions (e.g., applause blocks)
+        if exclude_regions:
+            in_excluded = False
+            for ex_start, ex_end in exclude_regions:
+                if ex_start <= timestamp < ex_end:
+                    in_excluded = True
+                    break
+            if in_excluded:
+                continue
+
         ctx_start = max(0, i - context_windows)
         ctx_end = min(num_windows, i + context_windows + 1)
         context_indices = list(range(ctx_start, i)) + list(range(i + 1, ctx_end))
@@ -368,7 +441,7 @@ def detect_impulses(signal, sample_rate, window_ms=50, context_ms=500, threshold
 
         if excess > threshold_db:
             impulses.append({
-                "timestamp": i * window_ms / 1000,
+                "timestamp": timestamp,
                 "window_idx": i,
                 "peak_db": float(peaks_db[i]),
                 "context_db": float(context_avg_db),
@@ -391,6 +464,142 @@ def attenuate_impulses(signal, impulses, sample_rate, window_ms=50):
             target_peak = 10 ** (imp["context_db"] / 20)
             scale = target_peak / current_peak
             signal[start:end] *= scale
+
+    return signal
+
+
+APPLAUSE_FLATNESS_THRESHOLD = 0.03  # spectral flatness above this = applause
+APPLAUSE_WINDOW_SEC = 0.5  # analysis window for spectral flatness
+APPLAUSE_FADE_SEC = 0.5  # crossfade duration for gain transitions
+
+
+def detect_applause(signal, sample_rate):
+    """Detect applause sections using spectral flatness.
+
+    Downsamples to 22050Hz for consistent flatness values regardless of source SR.
+    Returns a list of (start_sec, end_sec) tuples for each applause block.
+    """
+    import librosa
+
+    # Downsample to 22050Hz for consistent spectral flatness behavior.
+    # Higher sample rates spread energy across more bins, diluting flatness.
+    analysis_sr = 22050
+    if sample_rate != analysis_sr:
+        analysis_signal = librosa.resample(signal.astype(np.float32), orig_sr=sample_rate, target_sr=analysis_sr)
+    else:
+        analysis_signal = signal.astype(np.float32)
+
+    # Compute spectral flatness in windows
+    n_fft = int(analysis_sr * APPLAUSE_WINDOW_SEC)
+    hop_length = n_fft  # non-overlapping windows
+    flatness = librosa.feature.spectral_flatness(
+        y=analysis_signal, n_fft=n_fft, hop_length=hop_length
+    )[0]
+
+    # Label each window as applause or not
+    is_applause = flatness >= APPLAUSE_FLATNESS_THRESHOLD
+
+    # Group consecutive applause windows into blocks
+    blocks = []
+    in_block = False
+    block_start = 0
+
+    for i, appl in enumerate(is_applause):
+        if appl and not in_block:
+            block_start = i
+            in_block = True
+        elif not appl and in_block:
+            start_sec = block_start * APPLAUSE_WINDOW_SEC
+            end_sec = i * APPLAUSE_WINDOW_SEC
+            blocks.append((start_sec, end_sec))
+            in_block = False
+
+    if in_block:
+        start_sec = block_start * APPLAUSE_WINDOW_SEC
+        end_sec = len(is_applause) * APPLAUSE_WINDOW_SEC
+        blocks.append((start_sec, end_sec))
+
+    # Merge blocks that are within 2 seconds of each other
+    merged = []
+    for start, end in blocks:
+        if merged and start - merged[-1][1] <= 2.0:
+            merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+
+    # Extend each block backward by 0.5s to catch onset claps
+    extended = [(max(0, start - 0.5), end) for start, end in merged]
+
+    return extended
+
+
+def attenuate_applause(signal, sample_rate, applause_blocks):
+    """Attenuate applause sections so their peak matches the peak of music sections.
+
+    Applies a smoothed gain curve to avoid abrupt volume changes.
+    Returns the modified signal.
+    """
+    if not applause_blocks:
+        return signal
+
+    total_samples = len(signal)
+    window_samples = int(sample_rate * APPLAUSE_WINDOW_SEC)
+
+    # Compute per-window peak amplitude
+    n_windows = total_samples // window_samples
+    if n_windows == 0:
+        return signal
+
+    trimmed = np.abs(signal[:n_windows * window_samples].reshape(n_windows, window_samples))
+    window_peaks = trimmed.max(axis=1)
+
+    # Build a mask: True for music windows, False for applause windows
+    music_mask = np.ones(n_windows, dtype=bool)
+    for start_sec, end_sec in applause_blocks:
+        start_win = int(start_sec / APPLAUSE_WINDOW_SEC)
+        end_win = int(end_sec / APPLAUSE_WINDOW_SEC)
+        music_mask[start_win:end_win] = False
+
+    # Find the peak of music sections, then set applause ceiling 1 dB below
+    music_peaks = window_peaks[music_mask]
+    if len(music_peaks) == 0:
+        return signal
+    music_peak = np.max(music_peaks)
+
+    if music_peak == 0:
+        return signal
+
+    # 4 dB below music peak: multiply by 10^(-4/20) ≈ 0.631
+    applause_ceiling = music_peak * (10 ** (-4.0 / 20))
+
+    # Build per-window gain: 1.0 for music, reduced for applause
+    gains = np.ones(n_windows, dtype=np.float32)
+    for i in range(n_windows):
+        if not music_mask[i] and window_peaks[i] > applause_ceiling:
+            gains[i] = applause_ceiling / window_peaks[i]
+
+    # Smooth the gain curve to avoid abrupt transitions
+    fade_windows = max(1, int(APPLAUSE_FADE_SEC / APPLAUSE_WINDOW_SEC))
+    kernel = np.ones(fade_windows * 2 + 1) / (fade_windows * 2 + 1)
+    gains_smoothed = np.convolve(gains, kernel, mode="same").astype(np.float32)
+    # Ensure we never amplify — only attenuate
+    gains_smoothed = np.minimum(gains_smoothed, 1.0)
+
+    # Apply per-window gain to the signal
+    for i in range(n_windows):
+        if gains_smoothed[i] < 1.0:
+            start = i * window_samples
+            end = start + window_samples
+            signal[start:end] *= gains_smoothed[i]
+
+    # Second pass: ensure no applause window still exceeds ceiling after smoothing
+    for i in range(n_windows):
+        if not music_mask[i]:
+            start = i * window_samples
+            end = start + window_samples
+            actual_peak = np.max(np.abs(signal[start:end]))
+            if actual_peak > applause_ceiling:
+                signal[start:end] *= applause_ceiling / actual_peak
 
     return signal
 
@@ -420,21 +629,21 @@ def read_audio_as_float(filepath, temp_dir):
             original_sr = int(stream.get("sample_rate", 48000))
             break
 
-    float_path = os.path.join(temp_dir, "float_convert.wav")
+    pcm_path = os.path.join(temp_dir, "pcm_convert.wav")
     cmd = [
         "ffmpeg", "-y", "-i", filepath,
-        "-acodec", "pcm_f32le", "-ar", str(original_sr),
-        float_path,
+        "-acodec", "pcm_s16le", "-ar", str(original_sr),
+        pcm_path,
     ]
     subprocess.run(cmd, capture_output=True, check=True)
 
-    with wave.open(float_path, "rb") as wf:
+    with wave.open(pcm_path, "rb") as wf:
         sr = wf.getframerate()
         n_channels = wf.getnchannels()
         n_frames = wf.getnframes()
         raw = wf.readframes(n_frames)
 
-    samples = np.frombuffer(raw, dtype=np.float32)
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
 
     if n_channels > 1:
         samples = samples.reshape(-1, n_channels)
@@ -443,14 +652,15 @@ def read_audio_as_float(filepath, temp_dir):
 
 
 def write_wav_from_float(filepath, signal, sample_rate, n_channels):
-    """Write a float32 signal array to a WAV file (32-bit float format)."""
-    signal = np.clip(signal, -1.0, 1.0).astype(np.float32)
+    """Write a float32 signal array to a 16-bit PCM WAV file."""
+    signal = np.clip(signal, -1.0, 1.0)
+    int_signal = (signal * 32767).astype(np.int16)
 
     with wave.open(filepath, "wb") as wf:
         wf.setnchannels(n_channels)
-        wf.setsampwidth(4)
+        wf.setsampwidth(2)
         wf.setframerate(sample_rate)
-        wf.writeframes(signal.tobytes())
+        wf.writeframes(int_signal.tobytes())
 
 
 def write_impulse_report(impulses_by_clip, output_dir):
@@ -475,21 +685,21 @@ def write_impulse_report(impulses_by_clip, output_dir):
     return report_path
 
 
-def replace_audio_for_clip(alignment, temp_dir, output_dir):
-    """Cut, clean, normalize, and mux audio for one video clip.
-    Returns (output_path, impulses_list) or (None, []) if skipped.
+def process_audio_for_clip(alignment, temp_dir):
+    """Phase 4: Cut, detect applause, attenuate impulses, peak normalize.
+
+    Returns (normalized_wav_path, applause_blocks, impulses) or (None, [], []) if skipped.
     """
     if alignment["skipped"]:
-        return None, []
+        return None, [], []
 
-    video_path = alignment["video"]["path"]
     video_duration = alignment["video"]["duration"]
     event_path = alignment["event"]["path"]
     offset = alignment["offset"]
     clip_num = alignment["clip_number"]
-    basename = os.path.basename(video_path)
+    basename = os.path.basename(alignment["video"]["path"])
 
-    print(f"\n  Processing clip {clip_num}: {basename}")
+    print(f"\n  Clip {clip_num}: {basename}")
 
     if offset < 0:
         print(f"    {YELLOW}WARNING: Negative offset ({offset:.2f}s) — "
@@ -509,21 +719,42 @@ def replace_audio_for_clip(alignment, temp_dir, output_dir):
     # Step 2: Read the audio segment
     signal, sr, nch = read_audio_as_float(cut_path, temp_dir)
 
-    # For impulse detection, work with mono
+    # Work with mono for detection algorithms
     if nch > 1:
         mono = signal.mean(axis=1)
     else:
         mono = signal
 
-    # Step 3: Detect and attenuate impulses
-    impulses = detect_impulses(mono, sr)
+    # Step 3: Detect and attenuate applause
+    applause_blocks = detect_applause(mono, sr)
+
+    if applause_blocks:
+        print(f"    Applause detected:")
+        for start, end in applause_blocks:
+            print(f"      {RED}APPLAUSE{RESET} {start:.1f}s - {end:.1f}s ({end - start:.1f}s)")
+        if nch > 1:
+            for ch in range(nch):
+                signal[:, ch] = attenuate_applause(signal[:, ch], sr, applause_blocks)
+        else:
+            signal = attenuate_applause(signal, sr, applause_blocks)
+        print(f"    Applause attenuated to match music level.")
+    else:
+        print(f"    No applause detected.")
+
+    # Recompute mono after applause attenuation
+    if nch > 1:
+        mono = signal.mean(axis=1)
+    else:
+        mono = signal
+
+    # Step 4: Detect and attenuate impulses
+    impulses = detect_impulses(mono, sr, exclude_regions=applause_blocks)
 
     if impulses:
         for imp in impulses:
-            print(f"    {RED}IMPULSE DETECTED{RESET} at {imp['timestamp']:.3f}s — "
+            print(f"      {RED}IMPULSE{RESET} at {imp['timestamp']:.3f}s — "
                   f"peak: {imp['peak_db']:.1f} dB, context: {imp['context_db']:.1f} dB, "
                   f"excess: {imp['excess_db']:.1f} dB")
-
         if nch > 1:
             for ch in range(nch):
                 signal[:, ch] = attenuate_impulses(signal[:, ch], impulses, sr)
@@ -532,7 +763,7 @@ def replace_audio_for_clip(alignment, temp_dir, output_dir):
     else:
         print(f"    No impulses detected.")
 
-    # Step 4: Peak normalize
+    # Step 5: Peak normalize
     if nch > 1:
         flat = signal.flatten()
     else:
@@ -545,26 +776,36 @@ def replace_audio_for_clip(alignment, temp_dir, output_dir):
     gain_db = 20 * np.log10(gain) if gain > 0 else 0
     print(f"    Peak normalized (gain: {gain_db:+.1f} dB)")
 
-    # Step 5: Write normalized audio to temp file
+    # Step 6: Write normalized audio to temp file
     norm_path = os.path.join(temp_dir, f"clip_{clip_num}_normalized.wav")
     write_wav_from_float(norm_path, signal, sr, nch)
 
-    # Step 6: Mux into final video
+    return norm_path, applause_blocks, impulses
+
+
+def mux_clip(alignment, norm_path, output_dir, keep_original_audio=False):
+    """Phase 5: Mux normalized audio into final video."""
+    if alignment["skipped"] or norm_path is None:
+        return None
+
+    video_path = alignment["video"]["path"]
+    clip_num = alignment["clip_number"]
+    basename = os.path.basename(video_path)
     output_path = os.path.join(output_dir, basename)
+
+    map_args = ["-map", "0:v", "-map", "1:a"]
+    if keep_original_audio:
+        map_args += ["-map", "0:a"]
     cmd = [
         "ffmpeg", "-y",
         "-i", video_path,
         "-i", norm_path,
         "-c:v", "copy",
-        "-map", "0:v",
-        "-map", "1:a",
-        output_path,
-    ]
-    print(f"    Muxing final video to {output_path}...")
+    ] + map_args + [output_path]
+    print(f"    Clip {clip_num}: {basename} -> {output_path}")
     subprocess.run(cmd, capture_output=True, check=True)
 
-    print(f"    Done: {output_path}")
-    return output_path, impulses
+    return output_path
 
 
 def parse_args(argv=None):
@@ -580,6 +821,9 @@ def parse_args(argv=None):
         action="store_true",
         help="Include low-confidence alignment matches in output instead of skipping them",
     )
+    parser.add_argument("--temp-dir", help="Directory for temporary files (default: system temp)")
+    parser.add_argument("--no-hint", action="store_true", help="Skip metadata timestamp heuristic, always do full scan")
+    parser.add_argument("--keep-original-audio", action="store_true", help="Keep original video audio as a second track (for verifying alignment)")
     return parser.parse_args(argv)
 
 
@@ -623,7 +867,10 @@ def main():
     events = group_audio_into_events(audio_files)
     print(f"  Detected {len(events)} event(s)")
 
-    with tempfile.TemporaryDirectory(prefix="sound_fixer_") as temp_dir:
+    if args.temp_dir:
+        os.makedirs(args.temp_dir, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="sound_fixer_", dir=args.temp_dir) as temp_dir:
         reconstituted = reconstitute_audio(events, temp_dir)
         for i, e in enumerate(reconstituted):
             print(f"  Event {i + 1}: {e['total_duration']:.0f}s "
@@ -637,15 +884,21 @@ def main():
             clip_filter=args.clip,
             from_clip=args.from_clip,
             it_is_what_it_is=args.it_is_what_it_is,
+            no_hint=args.no_hint,
         )
 
+        # Phase 4: Process audio
         print(f"\n{'=' * 60}")
-        print("Phase 4: Replacing audio in video clips")
+        print("Phase 4: Processing audio")
         print("=" * 60)
+        clip_results = []
         impulses_by_clip = []
 
         for alignment in alignments:
-            output_path, impulses = replace_audio_for_clip(alignment, temp_dir, output_dir)
+            norm_path, applause_blocks, impulses = process_audio_for_clip(
+                alignment, temp_dir,
+            )
+            clip_results.append((alignment, norm_path))
             if impulses:
                 clip_name = os.path.basename(alignment["video"]["path"])
                 impulses_by_clip.append((clip_name, impulses))
@@ -654,6 +907,14 @@ def main():
             report_path = write_impulse_report(impulses_by_clip, output_dir)
             print(f"\n  {RED}Impulse report written to: {report_path}{RESET}")
             print(f"  Review detected impulses in Audacity to verify they are genuine artifacts.")
+
+        # Phase 5: Mux final videos
+        print(f"\n{'=' * 60}")
+        print("Phase 5: Muxing final videos")
+        print("=" * 60)
+        for alignment, norm_path in clip_results:
+            mux_clip(alignment, norm_path, output_dir,
+                     keep_original_audio=args.keep_original_audio)
 
     print(f"\n{'=' * 60}")
     print("Summary")

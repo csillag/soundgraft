@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+test-input/
+test-output/
+*.egg-info/
+.superpowers-session.json
