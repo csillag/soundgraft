@@ -1,4 +1,11 @@
-# Sound Fixer — Future Extensions & Known Issues
+# SoundGraft
+
+## Rules
+
+- When using agents for search/research, monitor for "Tool result missing due to internal error" situations. Check in every 30 seconds, and clean up if necessary.
+- Don't add co-author references to LLMs in git commit messages.
+
+## Future Extensions & Known Issues
 
 ## TODO
 
