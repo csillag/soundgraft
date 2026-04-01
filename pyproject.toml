@@ -21,5 +21,12 @@ soundgraft = "soundgraft.cli:main"
 [project.urls]
 Homepage = "https://github.com/csillag/soundgraft"
 
+[project.optional-dependencies]
+dev = [
+    "build",
+    "twine",
+    "pytest",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
