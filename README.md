@@ -1,5 +1,7 @@
 # SoundGraft
 
+![SoundGraft](https://raw.githubusercontent.com/csillag/soundgraft/main/images/graft.jpg)
+
 Replace video clip audio with matched segments from a dedicated audio recording.
 
 When you record an event with both a camera and a separate high-quality audio recorder, SoundGraft automatically aligns each video clip to the audio timeline and swaps in the better audio track. It also cleans up the replacement audio by attenuating applause and impulse noise, then peak-normalizes the result.
