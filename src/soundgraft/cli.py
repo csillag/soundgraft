@@ -895,48 +895,107 @@ def candidate_suffix(alignment):
     return f"_cand{cand['rank']}_{alignment['offset']:.1f}s"
 
 
-def process_audio_for_clip(alignment, temp_dir, output_dir):
-    """Phase 4: Cut, detect applause, attenuate impulses, peak normalize.
+def get_keyframe_times(video_path):
+    """Return sorted keyframe presentation timestamps (seconds) for the video
+    stream, using ffprobe. Empty list on failure."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-skip_frame", "nokey",
+        "-show_frames",
+        "-show_entries", "frame=pts_time",
+        "-of", "csv=print_section=0",
+        video_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return []
+    times = []
+    for line in result.stdout.strip().split("\n"):
+        line = line.strip().rstrip(",")
+        if not line:
+            continue
+        try:
+            times.append(float(line))
+        except ValueError:
+            continue
+    return sorted(times)
 
-    Returns (normalized_wav_path, applause_blocks, impulses) or (None, [], []) if skipped.
+
+def process_audio_for_clip(alignment, temp_dir, output_dir, min_overlap_sec=DEFAULT_MIN_OVERLAP_SEC):
+    """Phase 4: keyframe-snap the overlap, trim the video (copy, no re-encode),
+    cut the matching audio, detect applause, attenuate impulses, peak normalize.
+
+    Returns (trimmed_video_path, normalized_wav_path, applause_blocks, impulses)
+    or (None, None, [], []) if skipped.
     """
     if alignment["skipped"]:
-        return None, [], []
+        return None, None, [], []
 
-    video_duration = alignment["video"]["duration"]
-    offset = alignment["offset"]
     clip_num = alignment["clip_number"]
     basename = os.path.basename(alignment["video"]["path"])
+    video_path = alignment["video"]["path"]
     suffix = candidate_suffix(alignment)
     log_name = os.path.splitext(basename)[0] + suffix + ".log"
     logger = ClipLogger(os.path.join(output_dir, log_name))
 
     print(f"\n  Clip {clip_num}: {basename}")
-
-    logger.log(f"    Match found at offset {offset:.2f}s, confidence: {alignment['confidence']:.4f}")
+    logger.log(f"    Confidence: {alignment['confidence']:.4f}, "
+               f"overlap {alignment['overlap_dur']:.1f}s, "
+               f"audio starts at {alignment['audio_start_in_video']:.2f}s in video")
     if alignment.get("candidate"):
         cand = alignment["candidate"]
         logger.log(f"    Shotgun candidate #{cand['rank']} — "
-                   f"raw offset {cand['raw_offset_items']} items, "
+                   f"raw lag {cand['raw_offset_items']} items, "
                    f"correction applied {cand['correction']:.2f}s")
 
-    if offset < 0:
-        logger.log(f"    {YELLOW}WARNING: Negative offset ({offset:.2f}s) — "
-                   f"video may start before the audio recording. Clamping to 0.{RESET}")
-        offset = 0
+    ov_start = alignment["ov_start"]
+    ov_end = alignment["ov_end"]
 
-    # Step 1: Cut the matching audio segment from the event.
-    # We cut from individual segments to avoid >4GB WAV file issues.
+    # Snap the overlap start forward to the first keyframe >= ov_start so we can
+    # cut the video with -c:v copy (no re-encode) and still be frame-accurate.
+    keyframe_times = get_keyframe_times(video_path)
+    kf_start = first_keyframe_at_or_after(keyframe_times, ov_start)
+    if kf_start is None or kf_start >= ov_end:
+        logger.log(f"    {RED}SKIP: no keyframe in overlap [{ov_start:.2f}s, {ov_end:.2f}s]{RESET}")
+        logger.close()
+        return None, None, [], []
+
+    effective_overlap = ov_end - kf_start
+    if effective_overlap < min_overlap_sec:
+        logger.log(f"    {RED}SKIP: overlap after keyframe snap "
+                   f"({effective_overlap:.1f}s) below min ({min_overlap_sec:.1f}s){RESET}")
+        logger.close()
+        return None, None, [], []
+
+    # Trim the video, copying the stream (no quality loss). Measure the actual
+    # duration afterward, since -c copy ends near a packet boundary.
+    trimmed_video = os.path.join(temp_dir, f"clip_{clip_num}{suffix}_trim{os.path.splitext(basename)[1]}")
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(kf_start),
+        "-i", video_path,
+        "-t", str(ov_end - kf_start),
+        "-c:v", "copy", "-an",
+        trimmed_video,
+    ]
+    subprocess.run(cmd, capture_output=True, check=True)
+
+    trimmed_meta = get_file_metadata(trimmed_video)
+    D = trimmed_meta["duration"]
+    logger.log(f"    Trimmed video from keyframe {kf_start:.2f}s, duration {D:.2f}s "
+               f"(dropped {kf_start - ov_start:.2f}s lead-in)")
+
+    # Audio cut starts at the audio-time corresponding to kf_start, length D.
+    audio_cut_start = alignment["audio_cut_start"] + (kf_start - ov_start)
     cut_path = os.path.join(temp_dir, f"clip_{clip_num}{suffix}_cut.wav")
     segments = alignment["event"]["segments"]
-    logger.log(f"    Cutting audio at offset {offset:.2f}s for {video_duration:.1f}s...")
+    logger.log(f"    Cutting audio at {audio_cut_start:.2f}s for {D:.2f}s...")
 
-    # Find which segment(s) the offset falls into
-    remaining_offset = offset
-    remaining_duration = video_duration
+    remaining_offset = audio_cut_start
+    remaining_duration = D
     cut_parts = []
     part_idx = 0
-
     for seg in segments:
         if remaining_duration <= 0:
             break
@@ -944,13 +1003,12 @@ def process_audio_for_clip(alignment, temp_dir, output_dir):
         if remaining_offset >= seg_dur:
             remaining_offset -= seg_dur
             continue
-        # This segment contains (part of) the audio we need
         take_duration = min(remaining_duration, seg_dur - remaining_offset)
         part_path = os.path.join(temp_dir, f"clip_{clip_num}{suffix}_part_{part_idx}.wav")
         cmd = [
             "ffmpeg", "-y", "-i", seg["path"],
             "-ss", str(remaining_offset), "-t", str(take_duration),
-            part_path
+            part_path,
         ]
         subprocess.run(cmd, capture_output=True, check=True)
         cut_parts.append(part_path)
@@ -959,13 +1017,12 @@ def process_audio_for_clip(alignment, temp_dir, output_dir):
         part_idx += 1
 
     if len(cut_parts) == 0:
-        logger.log(f"    {RED}ERROR: Offset {offset:.2f}s is beyond the event audio{RESET}")
+        logger.log(f"    {RED}ERROR: audio cut start {audio_cut_start:.2f}s is beyond the event audio{RESET}")
         logger.close()
-        return None, [], []
+        return None, None, [], []
     elif len(cut_parts) == 1:
         os.rename(cut_parts[0], cut_path)
     else:
-        # Concatenate parts with sox
         cmd = ["sox"] + cut_parts + [cut_path]
         subprocess.run(cmd, check=True)
         for p in cut_parts:
@@ -1036,29 +1093,22 @@ def process_audio_for_clip(alignment, temp_dir, output_dir):
     write_wav_from_float(norm_path, signal, sr, nch)
 
     logger.close()
-    return norm_path, applause_blocks, impulses
+    return trimmed_video, norm_path, applause_blocks, impulses
 
 
-def mux_clip(alignment, norm_path, output_dir, keep_original_audio=False):
-    """Phase 5: Mux normalized audio into final video."""
-    if alignment["skipped"] or norm_path is None:
+def mux_clip(alignment, trimmed_video_path, norm_path, output_dir, keep_original_audio=False):
+    """Phase 5: mux the normalized audio onto the trimmed (copied) video."""
+    if alignment["skipped"] or trimmed_video_path is None or norm_path is None:
         return None
 
-    video_path = alignment["video"]["path"]
     clip_num = alignment["clip_number"]
-    basename = os.path.basename(video_path)
+    basename = os.path.basename(alignment["video"]["path"])
     stem, ext = os.path.splitext(basename)
     output_path = os.path.join(output_dir, stem + candidate_suffix(alignment) + ext)
 
+    inputs = ["-i", trimmed_video_path, "-i", norm_path]
     map_args = ["-map", "0:v", "-map", "1:a"]
-    if keep_original_audio:
-        map_args += ["-map", "0:a"]
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-i", norm_path,
-        "-c:v", "copy",
-    ] + map_args + [output_path]
+    cmd = ["ffmpeg", "-y"] + inputs + ["-c:v", "copy"] + map_args + [output_path]
     print(f"    Clip {clip_num}: {basename} -> {output_path}")
     subprocess.run(cmd, capture_output=True, check=True)
 
@@ -1162,17 +1212,16 @@ def main():
         clip_results = []
 
         for alignment in alignments:
-            norm_path, applause_blocks, impulses = process_audio_for_clip(
-                alignment, temp_dir, output_dir,
-            )
-            clip_results.append((alignment, norm_path))
+            trimmed_video, norm_path, applause_blocks, impulses = process_audio_for_clip(
+                alignment, temp_dir, output_dir, min_overlap_sec=DEFAULT_MIN_OVERLAP_SEC)
+            clip_results.append((alignment, trimmed_video, norm_path))
 
         # Phase 5: Mux final videos
         print(f"\n{'=' * 60}")
         print("Phase 5: Muxing final videos")
         print("=" * 60)
-        for alignment, norm_path in clip_results:
-            mux_clip(alignment, norm_path, output_dir,
+        for alignment, trimmed_video, norm_path in clip_results:
+            mux_clip(alignment, trimmed_video, norm_path, output_dir,
                      keep_original_audio=args.keep_original_audio)
 
     print(f"\n{'=' * 60}")
