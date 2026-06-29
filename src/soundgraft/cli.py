@@ -260,7 +260,7 @@ def correlate_fingerprints_topn(fp_ref, fp_clip, n, nms_window_items,
     search_end = min(search_end, ref_len - clip_len)
     search_start = max(0, search_start)
 
-    if search_start >= search_end:
+    if search_end <= 0 or search_start >= search_end:
         return []
 
     total_bits = 32 * clip_len
