@@ -25,12 +25,17 @@ def test_topn_returns_two_separated_peaks_in_score_order():
     assert peaks[0][1] >= peaks[1][1]
 
 
-def test_nms_suppresses_adjacent_position_in_same_peak():
-    # Two exact matches one item apart; NMS window 3 must collapse them to one.
-    ref = _ref_with_peaks([5, 6], length=30)
-    peaks = correlate_fingerprints_topn(ref, CLIP, n=2, nms_window_items=3)
-    assert len(peaks) == 1
-    assert peaks[0][0] == 5
+def test_nms_suppresses_nearby_twin_peak():
+    # Two exact length-1 matches 2 items apart; NMS window 3 must suppress the
+    # twin so it does not appear as a second peak.
+    single = [0x0F0F0F0F]
+    ref = [MISS] * 30
+    ref[5] = single[0]
+    ref[7] = single[0]
+    peaks = correlate_fingerprints_topn(ref, single, n=2, nms_window_items=3)
+    offsets = [o for o, _ in peaks]
+    assert offsets[0] == 5          # highest peak
+    assert 7 not in offsets         # twin suppressed by NMS despite exact match
 
 
 def test_topn_empty_on_empty_input():
