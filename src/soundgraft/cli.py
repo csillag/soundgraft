@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -217,6 +218,68 @@ ALIGNMENT_OFFSET_CORRECTION = 0.5  # empirical correction for chromaprint alignm
 # seconds from a spurious one, large enough to collapse one peak's shoulder.
 NMS_WINDOW_ITEMS = 16
 
+# Minimum fingerprint-item overlap for a lag to be considered a real match.
+# ~40 items ≈ 5 s. Prevents a tiny accidental overlap from scoring a
+# spuriously perfect bit-match and beating the true alignment.
+MIN_OVERLAP_ITEMS_HARD = 40
+
+# Default product floor for how much of a clip must be covered by audio to be
+# worth emitting (seconds). Overridable via --min-overlap.
+DEFAULT_MIN_OVERLAP_SEC = 10.0
+
+
+def effective_min_overlap_items(min_overlap_sec):
+    """Convert a min-overlap in seconds to fingerprint items, never below the
+    correlation-sanity hard floor."""
+    return max(MIN_OVERLAP_ITEMS_HARD,
+               math.ceil(min_overlap_sec / FPCALC_ITEM_DURATION))
+
+
+def compute_overlap(lag_items, video_dur, audio_dur):
+    """Geometry SSOT: turn a signed correlation lag into video-time overlap.
+
+    lag_items is the index in the audio fingerprint aligned with the clip's
+    first item (signed; negative means the video leads). Returns a dict:
+      audio_start_in_video : where the audio recording begins in video time
+                             (>0 = audio starts partway into the video)
+      ov_start, ov_end     : overlap span in video time
+      ov_dur               : ov_end - ov_start (<=0 means no overlap)
+      audio_cut_start      : offset into the audio recording for the overlap
+    The offset correction is applied here, exactly once.
+    """
+    audio_start_in_video = -lag_items * FPCALC_ITEM_DURATION + ALIGNMENT_OFFSET_CORRECTION
+    ov_start = max(0.0, audio_start_in_video)
+    ov_end = min(video_dur, audio_start_in_video + audio_dur)
+    ov_dur = ov_end - ov_start
+    audio_cut_start = ov_start - audio_start_in_video
+    return {
+        "audio_start_in_video": audio_start_in_video,
+        "ov_start": ov_start,
+        "ov_end": ov_end,
+        "ov_dur": ov_dur,
+        "audio_cut_start": audio_cut_start,
+    }
+
+
+def first_keyframe_at_or_after(keyframe_times, ov_start):
+    """Return the first keyframe timestamp >= ov_start, or None if none.
+    keyframe_times must be sorted ascending."""
+    for t in keyframe_times:
+        if t >= ov_start:
+            return t
+    return None
+
+
+def classify_alignment_skip(score, overlap_dur, min_overlap_sec, it_is_what_it_is):
+    """Return a skip reason string, or None to keep the clip.
+    Min-overlap is a hard product floor (not overridable by it_is_what_it_is);
+    low-confidence is overridable."""
+    if overlap_dur < min_overlap_sec:
+        return "below-min-overlap"
+    if score < CONFIDENCE_THRESHOLD and not it_is_what_it_is:
+        return "low-confidence"
+    return None
+
 
 def get_fingerprint(filepath):
     """Get raw chromaprint fingerprint for an audio file using fpcalc.
@@ -240,40 +303,46 @@ def popcnt(x):
 
 
 def correlate_fingerprints_topn(fp_ref, fp_clip, n, nms_window_items,
-                                search_start=0, search_end=None):
-    """Slide fp_clip over fp_ref and return the top-N correlation peaks.
+                                min_overlap_items, search_start=None, search_end=None):
+    """Cross-correlate fp_clip against fp_ref over all signed lags.
 
-    Returns a list of (offset_items, score) tuples sorted by score descending,
-    length <= n. Peaks are separated by non-maximum suppression: after each
-    pick, all positions within +/- nms_window_items are suppressed so the
-    next pick comes from a different peak rather than the same peak's shoulder.
+    A lag L is the index in fp_ref aligned with fp_clip[0]; L may be negative
+    (the clip leads). Each lag is scored on its overlapping items only:
+    1 - bit_errors / (32 * overlap). Lags whose overlap is below
+    min_overlap_items are excluded entirely. Returns up to n (lag, score)
+    peaks, descending score, separated by non-maximum suppression.
+
+    search_start / search_end, when given, are inclusive bounds on the lag.
     """
     clip_len = len(fp_clip)
     ref_len = len(fp_ref)
-
     if clip_len == 0 or ref_len == 0:
         return []
 
-    if search_end is None:
-        search_end = ref_len - clip_len
-
-    search_end = min(search_end, ref_len - clip_len)
-    search_start = max(0, search_start)
-
-    if search_end <= 0 or search_start >= search_end:
+    lo_lag = -(clip_len - 1)
+    hi_lag = ref_len - 1
+    if search_start is not None:
+        lo_lag = max(lo_lag, search_start)
+    if search_end is not None:
+        hi_lag = min(hi_lag, search_end)
+    if lo_lag > hi_lag:
         return []
 
-    total_bits = 32 * clip_len
-    # Score array indexed by absolute offset; unscanned positions stay -1.0.
-    scores = np.full(search_end, -1.0)
+    n_lags = hi_lag - lo_lag + 1
+    scores = np.full(n_lags, -1.0)
 
-    for offset in tqdm(range(search_start, search_end),
-                       desc="    Aligning", unit="pos",
-                       bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
+    for lag in tqdm(range(lo_lag, hi_lag + 1),
+                    desc="    Aligning", unit="lag",
+                    bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
+        i_start = max(0, -lag)
+        i_end = min(clip_len, ref_len - lag)
+        overlap = i_end - i_start
+        if overlap < min_overlap_items:
+            continue
         bit_errors = 0
-        for i in range(clip_len):
-            bit_errors += popcnt(fp_ref[offset + i] ^ fp_clip[i])
-        scores[offset] = 1.0 - (bit_errors / total_bits)
+        for i in range(i_start, i_end):
+            bit_errors += popcnt(fp_ref[lag + i] ^ fp_clip[i])
+        scores[lag - lo_lag] = 1.0 - (bit_errors / (32 * overlap))
 
     results = []
     work = scores.copy()
@@ -281,7 +350,7 @@ def correlate_fingerprints_topn(fp_ref, fp_clip, n, nms_window_items,
         idx = int(np.argmax(work))
         if work[idx] < 0:
             break
-        results.append((idx, float(scores[idx])))
+        results.append((idx + lo_lag, float(scores[idx])))
         lo = max(0, idx - nms_window_items)
         hi = min(len(work), idx + nms_window_items + 1)
         work[lo:hi] = -1.0
@@ -289,14 +358,10 @@ def correlate_fingerprints_topn(fp_ref, fp_clip, n, nms_window_items,
     return results
 
 
-def correlate_fingerprints(fp_ref, fp_clip, search_start=0, search_end=None):
-    """Slide fp_clip over fp_ref and find the offset with highest correlation.
-
-    Returns (best_offset_items, best_score) where best_offset_items is the
-    position in fp_ref where fp_clip best matches, and best_score is 0.0-1.0.
-    """
+def correlate_fingerprints(fp_ref, fp_clip, min_overlap_items, search_start=None, search_end=None):
+    """Best single signed lag. Returns (lag, score), or (0, 0.0) if none."""
     peaks = correlate_fingerprints_topn(
-        fp_ref, fp_clip, 1, NMS_WINDOW_ITEMS, search_start, search_end)
+        fp_ref, fp_clip, 1, NMS_WINDOW_ITEMS, min_overlap_items, search_start, search_end)
     if not peaks:
         return 0, 0.0
     return peaks[0]
@@ -331,12 +396,16 @@ def fingerprint_events(events):
     return event_fingerprints
 
 
-def align_clip_to_event(video_path, event, fp_ref, video_meta, no_hint=False):
+def align_clip_to_event(video_path, event, fp_ref, video_meta, no_hint=False, min_overlap_items=None):
     """Align a video clip to an event using chromaprint fingerprint correlation.
 
-    fp_ref is the pre-computed fingerprint for the event.
-    Returns (offset_seconds, confidence_score) or (None, 0) on failure.
+    fp_ref is the pre-computed fingerprint for the event. Returns
+    (lag_items, score), where lag_items is the signed offset of the clip's
+    first item within the event audio. Returns (None, 0) on failure.
     """
+    if min_overlap_items is None:
+        min_overlap_items = effective_min_overlap_items(DEFAULT_MIN_OVERLAP_SEC)
+
     video_time = parse_timestamp(video_meta["creation_time"])
     event_start = parse_timestamp(event["start_time"])
 
@@ -350,39 +419,37 @@ def align_clip_to_event(video_path, event, fp_ref, video_meta, no_hint=False):
     print(f"    Reference: {len(fp_ref)} items ({len(fp_ref) * FPCALC_ITEM_DURATION:.0f}s), "
           f"Clip: {len(fp_clip)} items ({len(fp_clip) * FPCALC_ITEM_DURATION:.0f}s)")
 
-    # Try metadata-hinted search first
+    # Try metadata-hinted search first (expressed as a signed-lag window).
     if not no_hint and timestamps_look_plausible(video_time, event_start):
         offset_hint = (video_time - event_start).total_seconds()
-        # Search window: +/- 30 minutes around expected position
-        hint_start = int(max(0, offset_hint - 1800) / FPCALC_ITEM_DURATION)
-        hint_end = int((offset_hint + 1800 + video_meta["duration"]) / FPCALC_ITEM_DURATION)
+        hint_start = int((offset_hint - 1800) / FPCALC_ITEM_DURATION)
+        hint_end = int((offset_hint + 1800) / FPCALC_ITEM_DURATION)
 
         print(f"    Trying metadata-hinted window "
               f"({hint_start * FPCALC_ITEM_DURATION:.0f}s - {hint_end * FPCALC_ITEM_DURATION:.0f}s)...")
 
-        offset_items, score = correlate_fingerprints(fp_ref, fp_clip, hint_start, hint_end)
-        offset_secs = offset_items * FPCALC_ITEM_DURATION + ALIGNMENT_OFFSET_CORRECTION + ALIGNMENT_OFFSET_CORRECTION
+        lag_items, score = correlate_fingerprints(
+            fp_ref, fp_clip, min_overlap_items, hint_start, hint_end)
 
         if score >= CONFIDENCE_THRESHOLD:
-            print(f"    Match found! Offset: {offset_secs:.2f}s, confidence: {score:.4f}")
-            return offset_secs, score
+            print(f"    Match found! Lag: {lag_items} items, confidence: {score:.4f}")
+            return lag_items, score
         else:
             print(f"    Narrow search inconclusive (score: {score:.4f}), falling back to full scan...")
 
-    # Full scan
+    # Full scan over all signed lags.
     print(f"    Full scan of {len(fp_ref) * FPCALC_ITEM_DURATION:.0f}s event audio...")
-    offset_items, score = correlate_fingerprints(fp_ref, fp_clip)
-    offset_secs = offset_items * FPCALC_ITEM_DURATION + ALIGNMENT_OFFSET_CORRECTION
+    lag_items, score = correlate_fingerprints(fp_ref, fp_clip, min_overlap_items)
 
     if score >= CONFIDENCE_THRESHOLD:
-        print(f"    Match found! Offset: {offset_secs:.2f}s, confidence: {score:.4f}")
+        print(f"    Match found! Lag: {lag_items} items, confidence: {score:.4f}")
     else:
-        print(f"    Low confidence match. Offset: {offset_secs:.2f}s, confidence: {score:.4f}")
+        print(f"    Low confidence match. Lag: {lag_items} items, confidence: {score:.4f}")
 
-    return offset_secs, score
+    return lag_items, score
 
 
-def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=False):
+def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=False, min_overlap_items=None):
     """Build up to n candidate alignments for one clip (shotgun mode).
 
     Chooses the single best event using the normal per-event selection, then
@@ -391,6 +458,9 @@ def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=F
     is intentionally ignored for the peak survey — the hinted auto-pick is what
     produced the bad match in the first place.
     """
+    if min_overlap_items is None:
+        min_overlap_items = effective_min_overlap_items(DEFAULT_MIN_OVERLAP_SEC)
+
     fp_clip = get_fingerprint(video["path"])
     if not fp_clip:
         return []
@@ -402,7 +472,9 @@ def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=F
         fp_ref = event_fingerprints[j]
         if not fp_ref:
             continue
-        _, score = align_clip_to_event(video["path"], event, fp_ref, video, no_hint=no_hint)
+        _, score = align_clip_to_event(
+            video["path"], event, fp_ref, video, no_hint=no_hint,
+            min_overlap_items=min_overlap_items)
         if score > best_score:
             best_score = score
             best_event_idx = j
@@ -414,31 +486,40 @@ def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=F
     fp_ref = event_fingerprints[best_event_idx]
 
     print(f"    Shotgun: full-scan top-{n} peaks of event {best_event_idx + 1}...")
-    peaks = correlate_fingerprints_topn(fp_ref, fp_clip, n, NMS_WINDOW_ITEMS)
+    peaks = correlate_fingerprints_topn(
+        fp_ref, fp_clip, n, NMS_WINDOW_ITEMS, min_overlap_items)
 
     candidates = []
-    for rank, (offset_items, score) in enumerate(peaks, start=1):
-        offset_secs = offset_items * FPCALC_ITEM_DURATION + ALIGNMENT_OFFSET_CORRECTION
+    for rank, (lag_items, score) in enumerate(peaks, start=1):
+        geo = compute_overlap(lag_items, video["duration"], event["total_duration"])
         candidates.append({
             "video": video,
             "clip_number": clip_num,
             "event": event,
-            "offset": offset_secs,
+            "offset": geo["audio_start_in_video"],
             "confidence": score,
             "skipped": False,
+            "skip_reason": None,
+            "ov_start": geo["ov_start"],
+            "ov_end": geo["ov_end"],
+            "overlap_dur": geo["ov_dur"],
+            "audio_cut_start": geo["audio_cut_start"],
+            "audio_start_in_video": geo["audio_start_in_video"],
             "candidate": {
                 "rank": rank,
-                "raw_offset_items": offset_items,
+                "raw_offset_items": lag_items,
                 "correction": ALIGNMENT_OFFSET_CORRECTION,
             },
         })
     return candidates
 
 
-def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=None, it_is_what_it_is=False, no_hint=False, shotgun=None):
+def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=None, it_is_what_it_is=False, no_hint=False, shotgun=None, min_overlap_sec=DEFAULT_MIN_OVERLAP_SEC):
     """Align video clips to events. Returns list of alignment results."""
     # Fingerprint all events once upfront
     event_fingerprints = fingerprint_events(events)
+
+    min_overlap_items = effective_min_overlap_items(min_overlap_sec)
 
     alignments = []
 
@@ -455,7 +536,8 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
 
         if shotgun:
             candidates = shotgun_align_clip(
-                video, events, event_fingerprints, clip_num, shotgun, no_hint=no_hint)
+                video, events, event_fingerprints, clip_num, shotgun, no_hint=no_hint,
+                min_overlap_items=min_overlap_items)
             if not candidates:
                 print(f"  {YELLOW}WARNING: Clip {clip_num} produced no shotgun candidates{RESET}")
             else:
@@ -466,7 +548,7 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
             continue
 
         # Try each event, pick best match
-        best_offset = None
+        best_lag = None
         best_score = 0
         best_event = None
 
@@ -475,25 +557,41 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
             if not fp_ref:
                 continue
             print(f"    Trying event {j + 1} ({event['total_duration']:.0f}s)...")
-            offset, score = align_clip_to_event(video["path"], event, fp_ref, video, no_hint=no_hint)
+            lag, score = align_clip_to_event(video["path"], event, fp_ref, video, no_hint=no_hint,
+                                             min_overlap_items=min_overlap_items)
             if score > best_score:
-                best_offset = offset
+                best_lag = lag
                 best_score = score
                 best_event = event
 
-        skipped = best_score < CONFIDENCE_THRESHOLD and not it_is_what_it_is
+        geo = None
+        if best_lag is not None and best_event is not None:
+            geo = compute_overlap(best_lag, video["duration"], best_event["total_duration"])
+
+        overlap_dur = geo["ov_dur"] if geo else 0.0
+        skip_reason = classify_alignment_skip(
+            best_score, overlap_dur, min_overlap_sec, it_is_what_it_is)
+        if best_event is None:
+            skip_reason = "low-confidence"
+        skipped = skip_reason is not None
 
         if skipped:
-            print(f"  \033[33mWARNING: Clip {clip_num} skipped — "
-                  f"best confidence {best_score:.2f} below threshold {CONFIDENCE_THRESHOLD}\033[0m")
+            print(f"  \033[33mWARNING: Clip {clip_num} skipped — {skip_reason} "
+                  f"(confidence {best_score:.2f}, overlap {overlap_dur:.1f}s)\033[0m")
 
         alignments.append({
             "video": video,
             "clip_number": clip_num,
             "event": best_event,
-            "offset": best_offset,
+            "offset": geo["audio_start_in_video"] if geo else None,
             "confidence": best_score,
             "skipped": skipped,
+            "skip_reason": skip_reason,
+            "ov_start": geo["ov_start"] if geo else None,
+            "ov_end": geo["ov_end"] if geo else None,
+            "overlap_dur": overlap_dur,
+            "audio_cut_start": geo["audio_cut_start"] if geo else None,
+            "audio_start_in_video": geo["audio_start_in_video"] if geo else None,
         })
 
     return alignments
@@ -801,48 +899,113 @@ def candidate_suffix(alignment):
     return f"_cand{cand['rank']}_{alignment['offset']:.1f}s"
 
 
-def process_audio_for_clip(alignment, temp_dir, output_dir):
-    """Phase 4: Cut, detect applause, attenuate impulses, peak normalize.
+def get_keyframe_times(video_path):
+    """Return sorted keyframe presentation timestamps (seconds) for the video
+    stream, using ffprobe. Empty list on failure."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-skip_frame", "nokey",
+        "-show_frames",
+        "-show_entries", "frame=pts_time",
+        "-of", "csv=print_section=0",
+        video_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return []
+    times = []
+    for line in result.stdout.strip().split("\n"):
+        line = line.strip().rstrip(",")
+        if not line:
+            continue
+        try:
+            times.append(float(line))
+        except ValueError:
+            continue
+    return sorted(times)
 
-    Returns (normalized_wav_path, applause_blocks, impulses) or (None, [], []) if skipped.
+
+def process_audio_for_clip(alignment, temp_dir, output_dir, min_overlap_sec=DEFAULT_MIN_OVERLAP_SEC):
+    """Phase 4: keyframe-snap the overlap, trim the video (copy, no re-encode),
+    cut the matching audio, detect applause, attenuate impulses, peak normalize.
+
+    Returns (trimmed_video_path, normalized_wav_path, applause_blocks, impulses)
+    or (None, None, [], []) if skipped.
     """
     if alignment["skipped"]:
-        return None, [], []
+        return None, None, [], []
 
-    video_duration = alignment["video"]["duration"]
-    offset = alignment["offset"]
     clip_num = alignment["clip_number"]
     basename = os.path.basename(alignment["video"]["path"])
+    video_path = alignment["video"]["path"]
     suffix = candidate_suffix(alignment)
     log_name = os.path.splitext(basename)[0] + suffix + ".log"
     logger = ClipLogger(os.path.join(output_dir, log_name))
 
     print(f"\n  Clip {clip_num}: {basename}")
-
-    logger.log(f"    Match found at offset {offset:.2f}s, confidence: {alignment['confidence']:.4f}")
+    logger.log(f"    Confidence: {alignment['confidence']:.4f}, "
+               f"overlap {alignment['overlap_dur']:.1f}s, "
+               f"audio starts at {alignment['audio_start_in_video']:.2f}s in video")
     if alignment.get("candidate"):
         cand = alignment["candidate"]
         logger.log(f"    Shotgun candidate #{cand['rank']} — "
-                   f"raw offset {cand['raw_offset_items']} items, "
+                   f"raw lag {cand['raw_offset_items']} items, "
                    f"correction applied {cand['correction']:.2f}s")
 
-    if offset < 0:
-        logger.log(f"    {YELLOW}WARNING: Negative offset ({offset:.2f}s) — "
-                   f"video may start before the audio recording. Clamping to 0.{RESET}")
-        offset = 0
+    ov_start = alignment["ov_start"]
+    ov_end = alignment["ov_end"]
 
-    # Step 1: Cut the matching audio segment from the event.
-    # We cut from individual segments to avoid >4GB WAV file issues.
+    # Snap the overlap start forward to the first keyframe >= ov_start so we can
+    # cut the video with -c:v copy (no re-encode) and still be frame-accurate.
+    keyframe_times = get_keyframe_times(video_path)
+    kf_start = first_keyframe_at_or_after(keyframe_times, ov_start)
+    if kf_start is None or kf_start >= ov_end:
+        logger.log(f"    {RED}SKIP: no keyframe in overlap [{ov_start:.2f}s, {ov_end:.2f}s]{RESET}")
+        logger.close()
+        alignment["skipped"] = True
+        alignment["skip_reason"] = "no-keyframe-in-overlap"
+        return None, None, [], []
+
+    effective_overlap = ov_end - kf_start
+    if effective_overlap < min_overlap_sec:
+        logger.log(f"    {RED}SKIP: overlap after keyframe snap "
+                   f"({effective_overlap:.1f}s) below min ({min_overlap_sec:.1f}s){RESET}")
+        logger.close()
+        alignment["skipped"] = True
+        alignment["skip_reason"] = "below-min-overlap"
+        return None, None, [], []
+
+    # Trim the video, copying the stream (no quality loss). Measure the actual
+    # duration afterward, since -c copy ends near a packet boundary.
+    trimmed_video = os.path.join(temp_dir, f"clip_{clip_num}{suffix}_trim{os.path.splitext(basename)[1]}")
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(kf_start),
+        "-i", video_path,
+        "-t", str(ov_end - kf_start),
+        "-c:v", "copy", "-an",
+        trimmed_video,
+    ]
+    subprocess.run(cmd, capture_output=True, check=True)
+
+    trimmed_meta = get_file_metadata(trimmed_video)
+    D = trimmed_meta["duration"]
+    alignment["trim_start"] = kf_start
+    alignment["trim_dur"] = D
+    logger.log(f"    Trimmed video from keyframe {kf_start:.2f}s, duration {D:.2f}s "
+               f"(dropped {kf_start - ov_start:.2f}s lead-in)")
+
+    # Audio cut starts at the audio-time corresponding to kf_start, length D.
+    audio_cut_start = alignment["audio_cut_start"] + (kf_start - ov_start)
     cut_path = os.path.join(temp_dir, f"clip_{clip_num}{suffix}_cut.wav")
     segments = alignment["event"]["segments"]
-    logger.log(f"    Cutting audio at offset {offset:.2f}s for {video_duration:.1f}s...")
+    logger.log(f"    Cutting audio at {audio_cut_start:.2f}s for {D:.2f}s...")
 
-    # Find which segment(s) the offset falls into
-    remaining_offset = offset
-    remaining_duration = video_duration
+    remaining_offset = audio_cut_start
+    remaining_duration = D
     cut_parts = []
     part_idx = 0
-
     for seg in segments:
         if remaining_duration <= 0:
             break
@@ -850,13 +1013,12 @@ def process_audio_for_clip(alignment, temp_dir, output_dir):
         if remaining_offset >= seg_dur:
             remaining_offset -= seg_dur
             continue
-        # This segment contains (part of) the audio we need
         take_duration = min(remaining_duration, seg_dur - remaining_offset)
         part_path = os.path.join(temp_dir, f"clip_{clip_num}{suffix}_part_{part_idx}.wav")
         cmd = [
             "ffmpeg", "-y", "-i", seg["path"],
             "-ss", str(remaining_offset), "-t", str(take_duration),
-            part_path
+            part_path,
         ]
         subprocess.run(cmd, capture_output=True, check=True)
         cut_parts.append(part_path)
@@ -865,13 +1027,14 @@ def process_audio_for_clip(alignment, temp_dir, output_dir):
         part_idx += 1
 
     if len(cut_parts) == 0:
-        logger.log(f"    {RED}ERROR: Offset {offset:.2f}s is beyond the event audio{RESET}")
+        logger.log(f"    {RED}ERROR: audio cut start {audio_cut_start:.2f}s is beyond the event audio{RESET}")
         logger.close()
-        return None, [], []
+        alignment["skipped"] = True
+        alignment["skip_reason"] = "audio-beyond-event"
+        return None, None, [], []
     elif len(cut_parts) == 1:
         os.rename(cut_parts[0], cut_path)
     else:
-        # Concatenate parts with sox
         cmd = ["sox"] + cut_parts + [cut_path]
         subprocess.run(cmd, check=True)
         for p in cut_parts:
@@ -942,29 +1105,26 @@ def process_audio_for_clip(alignment, temp_dir, output_dir):
     write_wav_from_float(norm_path, signal, sr, nch)
 
     logger.close()
-    return norm_path, applause_blocks, impulses
+    return trimmed_video, norm_path, applause_blocks, impulses
 
 
-def mux_clip(alignment, norm_path, output_dir, keep_original_audio=False):
-    """Phase 5: Mux normalized audio into final video."""
-    if alignment["skipped"] or norm_path is None:
+def mux_clip(alignment, trimmed_video_path, norm_path, output_dir, keep_original_audio=False):
+    """Phase 5: mux the normalized audio onto the trimmed (copied) video."""
+    if alignment["skipped"] or trimmed_video_path is None or norm_path is None:
         return None
 
-    video_path = alignment["video"]["path"]
     clip_num = alignment["clip_number"]
-    basename = os.path.basename(video_path)
+    basename = os.path.basename(alignment["video"]["path"])
     stem, ext = os.path.splitext(basename)
     output_path = os.path.join(output_dir, stem + candidate_suffix(alignment) + ext)
 
+    inputs = ["-i", trimmed_video_path, "-i", norm_path]
     map_args = ["-map", "0:v", "-map", "1:a"]
     if keep_original_audio:
-        map_args += ["-map", "0:a"]
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-i", norm_path,
-        "-c:v", "copy",
-    ] + map_args + [output_path]
+        inputs += ["-ss", str(alignment["trim_start"]), "-t", str(alignment["trim_dur"]),
+                   "-i", alignment["video"]["path"]]
+        map_args += ["-map", "2:a"]
+    cmd = ["ffmpeg", "-y"] + inputs + ["-c:v", "copy"] + map_args + [output_path]
     print(f"    Clip {clip_num}: {basename} -> {output_path}")
     subprocess.run(cmd, capture_output=True, check=True)
 
@@ -993,6 +1153,14 @@ def parse_args(argv=None):
         metavar="N",
         help="Emit N candidate outputs per clip (different alignment offsets) "
              "instead of auto-picking one. Use to recover from a bad match.",
+    )
+    parser.add_argument(
+        "--min-overlap",
+        type=float,
+        default=DEFAULT_MIN_OVERLAP_SEC,
+        metavar="SEC",
+        help=f"Minimum seconds of audio/video overlap to emit a clip "
+             f"(default: {DEFAULT_MIN_OVERLAP_SEC}). Below this, the clip is skipped.",
     )
     return parser.parse_args(argv)
 
@@ -1059,6 +1227,7 @@ def main():
             it_is_what_it_is=args.it_is_what_it_is,
             no_hint=args.no_hint,
             shotgun=args.shotgun,
+            min_overlap_sec=args.min_overlap,
         )
 
         # Phase 4: Process audio
@@ -1068,17 +1237,16 @@ def main():
         clip_results = []
 
         for alignment in alignments:
-            norm_path, applause_blocks, impulses = process_audio_for_clip(
-                alignment, temp_dir, output_dir,
-            )
-            clip_results.append((alignment, norm_path))
+            trimmed_video, norm_path, applause_blocks, impulses = process_audio_for_clip(
+                alignment, temp_dir, output_dir, min_overlap_sec=args.min_overlap)
+            clip_results.append((alignment, trimmed_video, norm_path))
 
         # Phase 5: Mux final videos
         print(f"\n{'=' * 60}")
         print("Phase 5: Muxing final videos")
         print("=" * 60)
-        for alignment, norm_path in clip_results:
-            mux_clip(alignment, norm_path, output_dir,
+        for alignment, trimmed_video, norm_path in clip_results:
+            mux_clip(alignment, trimmed_video, norm_path, output_dir,
                      keep_original_audio=args.keep_original_audio)
 
     print(f"\n{'=' * 60}")

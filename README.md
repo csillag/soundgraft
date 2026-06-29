@@ -10,7 +10,7 @@ When you record an event with both a camera and a separate high-quality audio re
 
 1. **File classification** — Scans the input directory and sorts files into audio recordings and video clips by extension.
 2. **Event grouping** — Groups consecutive audio segments into events using a file-size heuristic (a short segment followed by a full-length one marks an event boundary).
-3. **Alignment** — Uses [Chromaprint](https://acoustid.org/chromaprint) fingerprint correlation to find where each video clip sits within the audio timeline. Metadata timestamps provide a search hint when available; falls back to a full scan otherwise.
+3. **Alignment** — Cross-correlates [Chromaprint](https://acoustid.org/chromaprint) fingerprints to find where each video clip overlaps the audio timeline, at any relative offset (the audio need not contain the whole clip). Metadata timestamps provide a search hint when available. The output video is trimmed to the audio-covered overlap, snapped to a keyframe so the video stream is copied without re-encoding.
 4. **Audio processing** — For each matched clip:
    - Cuts the corresponding segment from the audio recording
    - Detects and attenuates applause sections (spectral flatness analysis)
@@ -58,6 +58,7 @@ Place all raw audio recordings and video clips in a single input directory. Outp
 | `--no-hint` | Skip metadata timestamp heuristic, always do full scan |
 | `--keep-original-audio` | Keep the original video audio as a second track |
 | `--shotgun N` | Emit N candidate outputs per clip (different alignment offsets) instead of auto-picking one; use to recover from a bad match. Output files are named `<clip>_cand<k>_<offset>s.<ext>`. |
+| `--min-overlap SEC` | Minimum seconds of audio/video overlap required to emit a clip (default: 10). Clips with less overlap are skipped. |
 | `--temp-dir DIR` | Directory for temporary files (default: system temp) |
 
 ### Supported formats
