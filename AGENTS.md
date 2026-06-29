@@ -37,3 +37,6 @@
 
 ### Loudness Normalization Option
 - Current design uses peak normalization only (correct for music). A future flag could offer EBU R128 loudness normalization for speech/conference recordings where perceptual consistency matters more than preserving dynamics.
+
+### Offset-Correction Path Asymmetry (pending data)
+- Hinted path applies `ALIGNMENT_OFFSET_CORRECTION` twice (1.0s); full-scan applies it once (0.5s). Both introduced together in commit 09efc7a, so history can't say which was empirically tuned. To be resolved by running normal vs `--no-hint` against a known-good clip and observing which syncs; shotgun `.log` files record the raw pre-correction offset to support this. Then unify both paths to the validated value.

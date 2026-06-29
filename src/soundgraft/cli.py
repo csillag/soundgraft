@@ -987,6 +987,13 @@ def parse_args(argv=None):
     parser.add_argument("--temp-dir", help="Directory for temporary files (default: system temp)")
     parser.add_argument("--no-hint", action="store_true", help="Skip metadata timestamp heuristic, always do full scan")
     parser.add_argument("--keep-original-audio", action="store_true", help="Keep original video audio as a second track (for verifying alignment)")
+    parser.add_argument(
+        "--shotgun",
+        type=int,
+        metavar="N",
+        help="Emit N candidate outputs per clip (different alignment offsets) "
+             "instead of auto-picking one. Use to recover from a bad match.",
+    )
     return parser.parse_args(argv)
 
 
@@ -994,6 +1001,10 @@ def main():
     args = parse_args()
     input_dir = args.input
     output_dir = args.output
+
+    if args.shotgun is not None and args.shotgun < 2:
+        print("Error: --shotgun N requires N >= 2.")
+        sys.exit(2)
 
     if not os.path.isdir(input_dir):
         print(f"Error: Input directory '{input_dir}' does not exist.")
@@ -1047,6 +1058,7 @@ def main():
             from_clip=args.from_clip,
             it_is_what_it_is=args.it_is_what_it_is,
             no_hint=args.no_hint,
+            shotgun=args.shotgun,
         )
 
         # Phase 4: Process audio
