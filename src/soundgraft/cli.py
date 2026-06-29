@@ -519,6 +519,8 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
     # Fingerprint all events once upfront
     event_fingerprints = fingerprint_events(events)
 
+    min_overlap_items = effective_min_overlap_items(min_overlap_sec)
+
     alignments = []
 
     for i, video in enumerate(video_files):
@@ -534,7 +536,8 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
 
         if shotgun:
             candidates = shotgun_align_clip(
-                video, events, event_fingerprints, clip_num, shotgun, no_hint=no_hint)
+                video, events, event_fingerprints, clip_num, shotgun, no_hint=no_hint,
+                min_overlap_items=min_overlap_items)
             if not candidates:
                 print(f"  {YELLOW}WARNING: Clip {clip_num} produced no shotgun candidates{RESET}")
             else:
@@ -554,7 +557,8 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
             if not fp_ref:
                 continue
             print(f"    Trying event {j + 1} ({event['total_duration']:.0f}s)...")
-            lag, score = align_clip_to_event(video["path"], event, fp_ref, video, no_hint=no_hint)
+            lag, score = align_clip_to_event(video["path"], event, fp_ref, video, no_hint=no_hint,
+                                             min_overlap_items=min_overlap_items)
             if score > best_score:
                 best_lag = lag
                 best_score = score
@@ -959,6 +963,8 @@ def process_audio_for_clip(alignment, temp_dir, output_dir, min_overlap_sec=DEFA
     if kf_start is None or kf_start >= ov_end:
         logger.log(f"    {RED}SKIP: no keyframe in overlap [{ov_start:.2f}s, {ov_end:.2f}s]{RESET}")
         logger.close()
+        alignment["skipped"] = True
+        alignment["skip_reason"] = "no-keyframe-in-overlap"
         return None, None, [], []
 
     effective_overlap = ov_end - kf_start
@@ -966,6 +972,8 @@ def process_audio_for_clip(alignment, temp_dir, output_dir, min_overlap_sec=DEFA
         logger.log(f"    {RED}SKIP: overlap after keyframe snap "
                    f"({effective_overlap:.1f}s) below min ({min_overlap_sec:.1f}s){RESET}")
         logger.close()
+        alignment["skipped"] = True
+        alignment["skip_reason"] = "below-min-overlap"
         return None, None, [], []
 
     # Trim the video, copying the stream (no quality loss). Measure the actual
@@ -983,6 +991,8 @@ def process_audio_for_clip(alignment, temp_dir, output_dir, min_overlap_sec=DEFA
 
     trimmed_meta = get_file_metadata(trimmed_video)
     D = trimmed_meta["duration"]
+    alignment["trim_start"] = kf_start
+    alignment["trim_dur"] = D
     logger.log(f"    Trimmed video from keyframe {kf_start:.2f}s, duration {D:.2f}s "
                f"(dropped {kf_start - ov_start:.2f}s lead-in)")
 
@@ -1019,6 +1029,8 @@ def process_audio_for_clip(alignment, temp_dir, output_dir, min_overlap_sec=DEFA
     if len(cut_parts) == 0:
         logger.log(f"    {RED}ERROR: audio cut start {audio_cut_start:.2f}s is beyond the event audio{RESET}")
         logger.close()
+        alignment["skipped"] = True
+        alignment["skip_reason"] = "audio-beyond-event"
         return None, None, [], []
     elif len(cut_parts) == 1:
         os.rename(cut_parts[0], cut_path)
@@ -1108,6 +1120,10 @@ def mux_clip(alignment, trimmed_video_path, norm_path, output_dir, keep_original
 
     inputs = ["-i", trimmed_video_path, "-i", norm_path]
     map_args = ["-map", "0:v", "-map", "1:a"]
+    if keep_original_audio:
+        inputs += ["-ss", str(alignment["trim_start"]), "-t", str(alignment["trim_dur"]),
+                   "-i", alignment["video"]["path"]]
+        map_args += ["-map", "2:a"]
     cmd = ["ffmpeg", "-y"] + inputs + ["-c:v", "copy"] + map_args + [output_path]
     print(f"    Clip {clip_num}: {basename} -> {output_path}")
     subprocess.run(cmd, capture_output=True, check=True)
