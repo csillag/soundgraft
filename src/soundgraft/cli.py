@@ -382,7 +382,60 @@ def align_clip_to_event(video_path, event, fp_ref, video_meta, no_hint=False):
     return offset_secs, score
 
 
-def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=None, it_is_what_it_is=False, no_hint=False):
+def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=False):
+    """Build up to n candidate alignments for one clip (shotgun mode).
+
+    Chooses the single best event using the normal per-event selection, then
+    runs a FULL scan of that event and returns its top-n correlation peaks as
+    candidate alignment dicts (ranked by descending score). The metadata hint
+    is intentionally ignored for the peak survey — the hinted auto-pick is what
+    produced the bad match in the first place.
+    """
+    fp_clip = get_fingerprint(video["path"])
+    if not fp_clip:
+        return []
+
+    # Pick the best event (respecting the hint just for event selection).
+    best_event_idx = None
+    best_score = -1.0
+    for j, event in enumerate(events):
+        fp_ref = event_fingerprints[j]
+        if not fp_ref:
+            continue
+        _, score = align_clip_to_event(video["path"], event, fp_ref, video, no_hint=no_hint)
+        if score > best_score:
+            best_score = score
+            best_event_idx = j
+
+    if best_event_idx is None:
+        return []
+
+    event = events[best_event_idx]
+    fp_ref = event_fingerprints[best_event_idx]
+
+    print(f"    Shotgun: full-scan top-{n} peaks of event {best_event_idx + 1}...")
+    peaks = correlate_fingerprints_topn(fp_ref, fp_clip, n, NMS_WINDOW_ITEMS)
+
+    candidates = []
+    for rank, (offset_items, score) in enumerate(peaks, start=1):
+        offset_secs = offset_items * FPCALC_ITEM_DURATION + ALIGNMENT_OFFSET_CORRECTION
+        candidates.append({
+            "video": video,
+            "clip_number": clip_num,
+            "event": event,
+            "offset": offset_secs,
+            "confidence": score,
+            "skipped": False,
+            "candidate": {
+                "rank": rank,
+                "raw_offset_items": offset_items,
+                "correction": ALIGNMENT_OFFSET_CORRECTION,
+            },
+        })
+    return candidates
+
+
+def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=None, it_is_what_it_is=False, no_hint=False, shotgun=None):
     """Align video clips to events. Returns list of alignment results."""
     # Fingerprint all events once upfront
     event_fingerprints = fingerprint_events(events)
@@ -399,6 +452,18 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
             continue
 
         print(f"\n  Clip {clip_num}: {os.path.basename(video['path'])} ({video['duration']:.1f}s)")
+
+        if shotgun:
+            candidates = shotgun_align_clip(
+                video, events, event_fingerprints, clip_num, shotgun, no_hint=no_hint)
+            if not candidates:
+                print(f"  {YELLOW}WARNING: Clip {clip_num} produced no shotgun candidates{RESET}")
+            else:
+                print(f"    {len(candidates)} candidate(s): " +
+                      ", ".join(f"#{c['candidate']['rank']} @ {c['offset']:.2f}s "
+                                f"(conf {c['confidence']:.3f})" for c in candidates))
+            alignments.extend(candidates)
+            continue
 
         # Try each event, pick best match
         best_offset = None
