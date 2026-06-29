@@ -1,7 +1,7 @@
 import subprocess
 import sys
 
-from soundgraft.cli import parse_args
+from soundgraft.cli import parse_args, DEFAULT_MIN_OVERLAP_SEC
 
 
 def test_shotgun_arg_parsed():
@@ -33,3 +33,13 @@ def test_missing_required_args():
         capture_output=True, text=True
     )
     assert result.returncode != 0
+
+
+def test_min_overlap_default():
+    args = parse_args(["--input", "in", "--output", "out"])
+    assert args.min_overlap == DEFAULT_MIN_OVERLAP_SEC
+
+
+def test_min_overlap_parsed():
+    args = parse_args(["--input", "in", "--output", "out", "--min-overlap", "25"])
+    assert args.min_overlap == 25.0

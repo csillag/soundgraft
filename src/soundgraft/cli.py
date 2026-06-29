@@ -1138,6 +1138,14 @@ def parse_args(argv=None):
         help="Emit N candidate outputs per clip (different alignment offsets) "
              "instead of auto-picking one. Use to recover from a bad match.",
     )
+    parser.add_argument(
+        "--min-overlap",
+        type=float,
+        default=DEFAULT_MIN_OVERLAP_SEC,
+        metavar="SEC",
+        help=f"Minimum seconds of audio/video overlap to emit a clip "
+             f"(default: {DEFAULT_MIN_OVERLAP_SEC}). Below this, the clip is skipped.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1203,6 +1211,7 @@ def main():
             it_is_what_it_is=args.it_is_what_it_is,
             no_hint=args.no_hint,
             shotgun=args.shotgun,
+            min_overlap_sec=args.min_overlap,
         )
 
         # Phase 4: Process audio
@@ -1213,7 +1222,7 @@ def main():
 
         for alignment in alignments:
             trimmed_video, norm_path, applause_blocks, impulses = process_audio_for_clip(
-                alignment, temp_dir, output_dir, min_overlap_sec=DEFAULT_MIN_OVERLAP_SEC)
+                alignment, temp_dir, output_dir, min_overlap_sec=args.min_overlap)
             clip_results.append((alignment, trimmed_video, norm_path))
 
         # Phase 5: Mux final videos
