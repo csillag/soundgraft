@@ -98,3 +98,13 @@ def test_offset_correction_default():
 def test_offset_correction_parsed():
     args = parse_args(["--input", "in", "--output", "out", "--offset-correction", "-0.19"])
     assert args.offset_correction == -0.19
+
+
+def test_no_cleanup_default_false():
+    args = parse_args(["--input", "in", "--output", "out"])
+    assert args.no_cleanup is False
+
+
+def test_no_cleanup_flag_sets_true():
+    args = parse_args(["--input", "in", "--output", "out", "--no-cleanup"])
+    assert args.no_cleanup is True
