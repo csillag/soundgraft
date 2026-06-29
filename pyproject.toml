@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "soundgraft"
-version = "0.1.1"
+version = "0.2.0"
 description = "Replace video audio with high-quality dedicated recordings"
 readme = "README.md"
 license = "Apache-2.0"
