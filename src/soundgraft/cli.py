@@ -914,13 +914,23 @@ def get_keyframe_times(video_path):
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         return []
+    return parse_keyframe_times(result.stdout)
+
+
+def parse_keyframe_times(stdout):
+    """Parse ffprobe csv output into sorted keyframe times (seconds).
+
+    Each line's FIRST comma-separated field is the pts_time. ffprobe may append
+    extra fields per frame (e.g. H.265 "User Data Unregistered SEI" side-data),
+    so only the first field is the timestamp; the rest must be ignored.
+    """
     times = []
-    for line in result.stdout.strip().split("\n"):
-        line = line.strip().rstrip(",")
-        if not line:
+    for line in stdout.strip().split("\n"):
+        field = line.split(",", 1)[0].strip()
+        if not field:
             continue
         try:
-            times.append(float(line))
+            times.append(float(field))
         except ValueError:
             continue
     return sorted(times)
