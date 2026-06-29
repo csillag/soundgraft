@@ -936,7 +936,7 @@ def parse_keyframe_times(stdout):
     return sorted(times)
 
 
-def process_audio_for_clip(alignment, temp_dir, output_dir, min_overlap_sec=DEFAULT_MIN_OVERLAP_SEC):
+def process_audio_for_clip(alignment, temp_dir, output_dir, min_overlap_sec=DEFAULT_MIN_OVERLAP_SEC, no_cleanup=False):
     """Phase 4: keyframe-snap the overlap, trim the video (copy, no re-encode),
     cut the matching audio, detect applause, attenuate impulses, peak normalize.
 
@@ -1059,43 +1059,49 @@ def process_audio_for_clip(alignment, temp_dir, output_dir, min_overlap_sec=DEFA
     else:
         mono = signal
 
-    # Step 3: Detect and attenuate applause
-    applause_blocks = detect_applause(mono, sr)
+    # Steps 3-4: Detect and attenuate applause + impulses, unless --no-cleanup.
+    if no_cleanup:
+        logger.log(f"    Cleanup disabled (--no-cleanup): skipping applause + impulse processing.")
+        applause_blocks = []
+        impulses = []
+    else:
+        # Step 3: Detect and attenuate applause
+        applause_blocks = detect_applause(mono, sr)
 
-    if applause_blocks:
-        logger.log(f"    Applause detected:")
-        for start, end in applause_blocks:
-            logger.log(f"      {RED}APPLAUSE{RESET} {start:.1f}s - {end:.1f}s ({end - start:.1f}s)")
-        if nch > 1:
-            for ch in range(nch):
-                signal[:, ch] = attenuate_applause(signal[:, ch], sr, applause_blocks)
+        if applause_blocks:
+            logger.log(f"    Applause detected:")
+            for start, end in applause_blocks:
+                logger.log(f"      {RED}APPLAUSE{RESET} {start:.1f}s - {end:.1f}s ({end - start:.1f}s)")
+            if nch > 1:
+                for ch in range(nch):
+                    signal[:, ch] = attenuate_applause(signal[:, ch], sr, applause_blocks)
+            else:
+                signal = attenuate_applause(signal, sr, applause_blocks)
+            logger.log(f"    Applause attenuated to match music level.")
         else:
-            signal = attenuate_applause(signal, sr, applause_blocks)
-        logger.log(f"    Applause attenuated to match music level.")
-    else:
-        logger.log(f"    No applause detected.")
+            logger.log(f"    No applause detected.")
 
-    # Recompute mono after applause attenuation
-    if nch > 1:
-        mono = signal.mean(axis=1)
-    else:
-        mono = signal
-
-    # Step 4: Detect and attenuate impulses
-    impulses = detect_impulses(mono, sr, exclude_regions=applause_blocks)
-
-    if impulses:
-        for imp in impulses:
-            logger.log(f"      {RED}IMPULSE{RESET} at {imp['timestamp']:.3f}s — "
-                       f"peak: {imp['peak_db']:.1f} dB, context: {imp['context_db']:.1f} dB, "
-                       f"excess: {imp['excess_db']:.1f} dB")
+        # Recompute mono after applause attenuation
         if nch > 1:
-            for ch in range(nch):
-                signal[:, ch] = attenuate_impulses(signal[:, ch], impulses, sr)
+            mono = signal.mean(axis=1)
         else:
-            signal = attenuate_impulses(signal, impulses, sr)
-    else:
-        logger.log(f"    No impulses detected.")
+            mono = signal
+
+        # Step 4: Detect and attenuate impulses
+        impulses = detect_impulses(mono, sr, exclude_regions=applause_blocks)
+
+        if impulses:
+            for imp in impulses:
+                logger.log(f"      {RED}IMPULSE{RESET} at {imp['timestamp']:.3f}s — "
+                           f"peak: {imp['peak_db']:.1f} dB, context: {imp['context_db']:.1f} dB, "
+                           f"excess: {imp['excess_db']:.1f} dB")
+            if nch > 1:
+                for ch in range(nch):
+                    signal[:, ch] = attenuate_impulses(signal[:, ch], impulses, sr)
+            else:
+                signal = attenuate_impulses(signal, impulses, sr)
+        else:
+            logger.log(f"    No impulses detected.")
 
     # Step 5: Peak normalize
     if nch > 1:
@@ -1157,6 +1163,7 @@ def parse_args(argv=None):
     parser.add_argument("--temp-dir", help="Directory for temporary files (default: system temp)")
     parser.add_argument("--no-hint", action="store_true", help="Skip metadata timestamp heuristic, always do full scan")
     parser.add_argument("--keep-original-audio", action="store_true", help="Keep original video audio as a second track (for verifying alignment)")
+    parser.add_argument("--no-cleanup", action="store_true", help="Skip applause and impulse detection/attenuation (keeps peak normalization)")
     parser.add_argument(
         "--shotgun",
         type=int,
@@ -1258,7 +1265,8 @@ def main():
 
         for alignment in alignments:
             trimmed_video, norm_path, applause_blocks, impulses = process_audio_for_clip(
-                alignment, temp_dir, output_dir, min_overlap_sec=args.min_overlap)
+                alignment, temp_dir, output_dir, min_overlap_sec=args.min_overlap,
+                no_cleanup=args.no_cleanup)
             clip_results.append((alignment, trimmed_video, norm_path))
 
         # Phase 5: Mux final videos

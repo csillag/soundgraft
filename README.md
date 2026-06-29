@@ -60,6 +60,7 @@ Place all raw audio recordings and video clips in a single input directory. Outp
 | `--shotgun N` | Emit N candidate outputs per clip (different alignment offsets) instead of auto-picking one; use to recover from a bad match. Output files are named `<clip>_cand<k>_<offset>s.<ext>`. |
 | `--min-overlap SEC` | Minimum seconds of audio/video overlap required to emit a clip (default: 10). Clips with less overlap are skipped. |
 | `--offset-correction SEC` | Seconds added to the chromaprint-derived audio offset to correct its fixed bias (default: -0.19). Lower it if the replaced audio plays late, raise it if early. |
+| `--no-cleanup` | Skip applause and impulse detection/attenuation (peak normalization still applied). |
 | `--temp-dir DIR` | Directory for temporary files (default: system temp) |
 
 ### Supported formats
