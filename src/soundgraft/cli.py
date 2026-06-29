@@ -211,7 +211,7 @@ def timestamps_look_plausible(video_time, event_start_time):
 
 
 FPCALC_ITEM_DURATION = 0.1238  # seconds per fingerprint item (4096 / 11025 / 3)
-ALIGNMENT_OFFSET_CORRECTION = 0.5  # empirical correction for chromaprint alignment bias
+ALIGNMENT_OFFSET_CORRECTION = -0.19  # empirical correction for chromaprint alignment bias (see AGENTS.md)
 
 # Non-maximum suppression window (in fingerprint items) for top-N peak
 # extraction. ~16 items ≈ 2.0 s: small enough to keep a true peak a few
@@ -235,7 +235,7 @@ def effective_min_overlap_items(min_overlap_sec):
                math.ceil(min_overlap_sec / FPCALC_ITEM_DURATION))
 
 
-def compute_overlap(lag_items, video_dur, audio_dur):
+def compute_overlap(lag_items, video_dur, audio_dur, correction=ALIGNMENT_OFFSET_CORRECTION):
     """Geometry SSOT: turn a signed correlation lag into video-time overlap.
 
     lag_items is the index in the audio fingerprint aligned with the clip's
@@ -247,7 +247,7 @@ def compute_overlap(lag_items, video_dur, audio_dur):
       audio_cut_start      : offset into the audio recording for the overlap
     The offset correction is applied here, exactly once.
     """
-    audio_start_in_video = -lag_items * FPCALC_ITEM_DURATION + ALIGNMENT_OFFSET_CORRECTION
+    audio_start_in_video = -lag_items * FPCALC_ITEM_DURATION + correction
     ov_start = max(0.0, audio_start_in_video)
     ov_end = min(video_dur, audio_start_in_video + audio_dur)
     ov_dur = ov_end - ov_start
@@ -449,7 +449,7 @@ def align_clip_to_event(video_path, event, fp_ref, video_meta, no_hint=False, mi
     return lag_items, score
 
 
-def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=False, min_overlap_items=None):
+def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=False, min_overlap_items=None, offset_correction=ALIGNMENT_OFFSET_CORRECTION):
     """Build up to n candidate alignments for one clip (shotgun mode).
 
     Chooses the single best event using the normal per-event selection, then
@@ -491,7 +491,7 @@ def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=F
 
     candidates = []
     for rank, (lag_items, score) in enumerate(peaks, start=1):
-        geo = compute_overlap(lag_items, video["duration"], event["total_duration"])
+        geo = compute_overlap(lag_items, video["duration"], event["total_duration"], correction=offset_correction)
         candidates.append({
             "video": video,
             "clip_number": clip_num,
@@ -508,13 +508,13 @@ def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=F
             "candidate": {
                 "rank": rank,
                 "raw_offset_items": lag_items,
-                "correction": ALIGNMENT_OFFSET_CORRECTION,
+                "correction": offset_correction,
             },
         })
     return candidates
 
 
-def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=None, it_is_what_it_is=False, no_hint=False, shotgun=None, min_overlap_sec=DEFAULT_MIN_OVERLAP_SEC):
+def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=None, it_is_what_it_is=False, no_hint=False, shotgun=None, min_overlap_sec=DEFAULT_MIN_OVERLAP_SEC, offset_correction=ALIGNMENT_OFFSET_CORRECTION):
     """Align video clips to events. Returns list of alignment results."""
     # Fingerprint all events once upfront
     event_fingerprints = fingerprint_events(events)
@@ -537,7 +537,7 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
         if shotgun:
             candidates = shotgun_align_clip(
                 video, events, event_fingerprints, clip_num, shotgun, no_hint=no_hint,
-                min_overlap_items=min_overlap_items)
+                min_overlap_items=min_overlap_items, offset_correction=offset_correction)
             if not candidates:
                 print(f"  {YELLOW}WARNING: Clip {clip_num} produced no shotgun candidates{RESET}")
             else:
@@ -566,7 +566,7 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
 
         geo = None
         if best_lag is not None and best_event is not None:
-            geo = compute_overlap(best_lag, video["duration"], best_event["total_duration"])
+            geo = compute_overlap(best_lag, video["duration"], best_event["total_duration"], correction=offset_correction)
 
         overlap_dur = geo["ov_dur"] if geo else 0.0
         skip_reason = classify_alignment_skip(
@@ -1172,6 +1172,15 @@ def parse_args(argv=None):
         help=f"Minimum seconds of audio/video overlap to emit a clip "
              f"(default: {DEFAULT_MIN_OVERLAP_SEC}). Below this, the clip is skipped.",
     )
+    parser.add_argument(
+        "--offset-correction",
+        type=float,
+        default=ALIGNMENT_OFFSET_CORRECTION,
+        metavar="SEC",
+        help=f"Seconds added to the chromaprint-derived audio offset to correct "
+             f"its fixed bias (default: {ALIGNMENT_OFFSET_CORRECTION}). Lower it if "
+             f"the replaced audio plays late; raise it if early.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1238,6 +1247,7 @@ def main():
             no_hint=args.no_hint,
             shotgun=args.shotgun,
             min_overlap_sec=args.min_overlap,
+            offset_correction=args.offset_correction,
         )
 
         # Phase 4: Process audio
