@@ -499,6 +499,12 @@ def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=F
             "offset": geo["audio_start_in_video"],
             "confidence": score,
             "skipped": False,
+            "skip_reason": None,
+            "ov_start": geo["ov_start"],
+            "ov_end": geo["ov_end"],
+            "overlap_dur": geo["ov_dur"],
+            "audio_cut_start": geo["audio_cut_start"],
+            "audio_start_in_video": geo["audio_start_in_video"],
             "candidate": {
                 "rank": rank,
                 "raw_offset_items": lag_items,
@@ -508,7 +514,7 @@ def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=F
     return candidates
 
 
-def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=None, it_is_what_it_is=False, no_hint=False, shotgun=None):
+def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=None, it_is_what_it_is=False, no_hint=False, shotgun=None, min_overlap_sec=DEFAULT_MIN_OVERLAP_SEC):
     """Align video clips to events. Returns list of alignment results."""
     # Fingerprint all events once upfront
     event_fingerprints = fingerprint_events(events)
@@ -554,24 +560,34 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
                 best_score = score
                 best_event = event
 
-        skipped = best_score < CONFIDENCE_THRESHOLD and not it_is_what_it_is
+        geo = None
+        if best_lag is not None and best_event is not None:
+            geo = compute_overlap(best_lag, video["duration"], best_event["total_duration"])
+
+        overlap_dur = geo["ov_dur"] if geo else 0.0
+        skip_reason = classify_alignment_skip(
+            best_score, overlap_dur, min_overlap_sec, it_is_what_it_is)
+        if best_event is None:
+            skip_reason = "low-confidence"
+        skipped = skip_reason is not None
 
         if skipped:
-            print(f"  \033[33mWARNING: Clip {clip_num} skipped — "
-                  f"best confidence {best_score:.2f} below threshold {CONFIDENCE_THRESHOLD}\033[0m")
-
-        offset = None
-        if best_lag is not None and best_event is not None:
-            offset = compute_overlap(
-                best_lag, video["duration"], best_event["total_duration"])["audio_start_in_video"]
+            print(f"  \033[33mWARNING: Clip {clip_num} skipped — {skip_reason} "
+                  f"(confidence {best_score:.2f}, overlap {overlap_dur:.1f}s)\033[0m")
 
         alignments.append({
             "video": video,
             "clip_number": clip_num,
             "event": best_event,
-            "offset": offset,
+            "offset": geo["audio_start_in_video"] if geo else None,
             "confidence": best_score,
             "skipped": skipped,
+            "skip_reason": skip_reason,
+            "ov_start": geo["ov_start"] if geo else None,
+            "ov_end": geo["ov_end"] if geo else None,
+            "overlap_dur": overlap_dur,
+            "audio_cut_start": geo["audio_cut_start"] if geo else None,
+            "audio_start_in_video": geo["audio_start_in_video"] if geo else None,
         })
 
     return alignments

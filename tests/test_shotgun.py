@@ -57,3 +57,22 @@ def test_shotgun_align_clip_returns_n_candidates():
             c["candidate"]["raw_offset_items"], video["duration"], event["total_duration"]
         )["audio_start_in_video"]
         assert abs(c["offset"] - expected) < 1e-9
+
+
+def test_shotgun_candidates_carry_geometry_fields():
+    from unittest.mock import patch
+    _CLIP = [0x0F0F0F0F, 0x33333333, 0x55555555]
+    _MISS = 0xFFFFFFFF
+    fp_ref = [_MISS] * 40
+    fp_ref[5:8] = _CLIP
+    fp_ref[25:28] = _CLIP
+    event = {"segments": [], "start_time": None, "total_duration": 5.0}
+    video = {"path": "clip.mp4", "duration": 0.4, "creation_time": None}
+    with patch("soundgraft.cli.get_fingerprint", return_value=_CLIP):
+        cands = shotgun_align_clip(
+            video, [event], [fp_ref], clip_num=1, n=2, no_hint=True, min_overlap_items=2)
+    for c in cands:
+        for key in ("ov_start", "ov_end", "overlap_dur", "audio_cut_start",
+                    "audio_start_in_video", "skip_reason"):
+            assert key in c
+        assert c["overlap_dur"] == c["ov_end"] - c["ov_start"]
