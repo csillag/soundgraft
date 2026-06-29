@@ -724,6 +724,18 @@ class ClipLogger:
         self.log_file.close()
 
 
+def candidate_suffix(alignment):
+    """Filename suffix distinguishing shotgun candidates.
+
+    Empty string for a normal (non-candidate) alignment, so default-mode
+    output, temp, and log filenames are unchanged.
+    """
+    cand = alignment.get("candidate")
+    if not cand:
+        return ""
+    return f"_cand{cand['rank']}_{alignment['offset']:.1f}s"
+
+
 def process_audio_for_clip(alignment, temp_dir, output_dir):
     """Phase 4: Cut, detect applause, attenuate impulses, peak normalize.
 
@@ -736,12 +748,18 @@ def process_audio_for_clip(alignment, temp_dir, output_dir):
     offset = alignment["offset"]
     clip_num = alignment["clip_number"]
     basename = os.path.basename(alignment["video"]["path"])
-    log_name = os.path.splitext(basename)[0] + ".log"
+    suffix = candidate_suffix(alignment)
+    log_name = os.path.splitext(basename)[0] + suffix + ".log"
     logger = ClipLogger(os.path.join(output_dir, log_name))
 
     print(f"\n  Clip {clip_num}: {basename}")
 
     logger.log(f"    Match found at offset {offset:.2f}s, confidence: {alignment['confidence']:.4f}")
+    if alignment.get("candidate"):
+        cand = alignment["candidate"]
+        logger.log(f"    Shotgun candidate #{cand['rank']} — "
+                   f"raw offset {cand['raw_offset_items']} items, "
+                   f"correction applied {cand['correction']:.2f}s")
 
     if offset < 0:
         logger.log(f"    {YELLOW}WARNING: Negative offset ({offset:.2f}s) — "
@@ -750,7 +768,7 @@ def process_audio_for_clip(alignment, temp_dir, output_dir):
 
     # Step 1: Cut the matching audio segment from the event.
     # We cut from individual segments to avoid >4GB WAV file issues.
-    cut_path = os.path.join(temp_dir, f"clip_{clip_num}_cut.wav")
+    cut_path = os.path.join(temp_dir, f"clip_{clip_num}{suffix}_cut.wav")
     segments = alignment["event"]["segments"]
     logger.log(f"    Cutting audio at offset {offset:.2f}s for {video_duration:.1f}s...")
 
@@ -769,7 +787,7 @@ def process_audio_for_clip(alignment, temp_dir, output_dir):
             continue
         # This segment contains (part of) the audio we need
         take_duration = min(remaining_duration, seg_dur - remaining_offset)
-        part_path = os.path.join(temp_dir, f"clip_{clip_num}_part_{part_idx}.wav")
+        part_path = os.path.join(temp_dir, f"clip_{clip_num}{suffix}_part_{part_idx}.wav")
         cmd = [
             "ffmpeg", "-y", "-i", seg["path"],
             "-ss", str(remaining_offset), "-t", str(take_duration),
@@ -855,7 +873,7 @@ def process_audio_for_clip(alignment, temp_dir, output_dir):
     logger.log(f"    Peak normalized (gain: {gain_db:+.1f} dB)")
 
     # Step 6: Write normalized audio to temp file
-    norm_path = os.path.join(temp_dir, f"clip_{clip_num}_normalized.wav")
+    norm_path = os.path.join(temp_dir, f"clip_{clip_num}{suffix}_normalized.wav")
     write_wav_from_float(norm_path, signal, sr, nch)
 
     logger.close()
@@ -870,7 +888,8 @@ def mux_clip(alignment, norm_path, output_dir, keep_original_audio=False):
     video_path = alignment["video"]["path"]
     clip_num = alignment["clip_number"]
     basename = os.path.basename(video_path)
-    output_path = os.path.join(output_dir, basename)
+    stem, ext = os.path.splitext(basename)
+    output_path = os.path.join(output_dir, stem + candidate_suffix(alignment) + ext)
 
     map_args = ["-map", "0:v", "-map", "1:a"]
     if keep_original_audio:
