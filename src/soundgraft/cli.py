@@ -212,6 +212,11 @@ def timestamps_look_plausible(video_time, event_start_time):
 FPCALC_ITEM_DURATION = 0.1238  # seconds per fingerprint item (4096 / 11025 / 3)
 ALIGNMENT_OFFSET_CORRECTION = 0.5  # empirical correction for chromaprint alignment bias
 
+# Non-maximum suppression window (in fingerprint items) for top-N peak
+# extraction. ~16 items ≈ 2.0 s: small enough to keep a true peak a few
+# seconds from a spurious one, large enough to collapse one peak's shoulder.
+NMS_WINDOW_ITEMS = 16
+
 
 def get_fingerprint(filepath):
     """Get raw chromaprint fingerprint for an audio file using fpcalc.
@@ -234,17 +239,20 @@ def popcnt(x):
     return bin(x & 0xFFFFFFFF).count("1")
 
 
-def correlate_fingerprints(fp_ref, fp_clip, search_start=0, search_end=None):
-    """Slide fp_clip over fp_ref and find the offset with highest correlation.
+def correlate_fingerprints_topn(fp_ref, fp_clip, n, nms_window_items,
+                                search_start=0, search_end=None):
+    """Slide fp_clip over fp_ref and return the top-N correlation peaks.
 
-    Returns (best_offset_items, best_score) where best_offset_items is the
-    position in fp_ref where fp_clip best matches, and best_score is 0.0-1.0.
+    Returns a list of (offset_items, score) tuples sorted by score descending,
+    length <= n. Peaks are separated by non-maximum suppression: after each
+    pick, all positions within +/- nms_window_items are suppressed so the
+    next pick comes from a different peak rather than the same peak's shoulder.
     """
     clip_len = len(fp_clip)
     ref_len = len(fp_ref)
 
     if clip_len == 0 or ref_len == 0:
-        return 0, 0.0
+        return []
 
     if search_end is None:
         search_end = ref_len - clip_len
@@ -252,26 +260,46 @@ def correlate_fingerprints(fp_ref, fp_clip, search_start=0, search_end=None):
     search_end = min(search_end, ref_len - clip_len)
     search_start = max(0, search_start)
 
-    if search_start >= search_end:
-        return 0, 0.0
+    if search_end <= 0 or search_start >= search_end:
+        return []
 
-    best_offset = 0
-    best_score = 0.0
-    total_positions = search_end - search_start
+    total_bits = 32 * clip_len
+    # Score array indexed by absolute offset; unscanned positions stay -1.0.
+    scores = np.full(search_end, -1.0)
 
     for offset in tqdm(range(search_start, search_end),
                        desc="    Aligning", unit="pos",
                        bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
         bit_errors = 0
-        total_bits = 32 * clip_len
         for i in range(clip_len):
             bit_errors += popcnt(fp_ref[offset + i] ^ fp_clip[i])
-        score = 1.0 - (bit_errors / total_bits)
-        if score > best_score:
-            best_score = score
-            best_offset = offset
+        scores[offset] = 1.0 - (bit_errors / total_bits)
 
-    return best_offset, best_score
+    results = []
+    work = scores.copy()
+    for _ in range(n):
+        idx = int(np.argmax(work))
+        if work[idx] < 0:
+            break
+        results.append((idx, float(scores[idx])))
+        lo = max(0, idx - nms_window_items)
+        hi = min(len(work), idx + nms_window_items + 1)
+        work[lo:hi] = -1.0
+
+    return results
+
+
+def correlate_fingerprints(fp_ref, fp_clip, search_start=0, search_end=None):
+    """Slide fp_clip over fp_ref and find the offset with highest correlation.
+
+    Returns (best_offset_items, best_score) where best_offset_items is the
+    position in fp_ref where fp_clip best matches, and best_score is 0.0-1.0.
+    """
+    peaks = correlate_fingerprints_topn(
+        fp_ref, fp_clip, 1, NMS_WINDOW_ITEMS, search_start, search_end)
+    if not peaks:
+        return 0, 0.0
+    return peaks[0]
 
 
 def fingerprint_events(events):
@@ -354,7 +382,60 @@ def align_clip_to_event(video_path, event, fp_ref, video_meta, no_hint=False):
     return offset_secs, score
 
 
-def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=None, it_is_what_it_is=False, no_hint=False):
+def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=False):
+    """Build up to n candidate alignments for one clip (shotgun mode).
+
+    Chooses the single best event using the normal per-event selection, then
+    runs a FULL scan of that event and returns its top-n correlation peaks as
+    candidate alignment dicts (ranked by descending score). The metadata hint
+    is intentionally ignored for the peak survey — the hinted auto-pick is what
+    produced the bad match in the first place.
+    """
+    fp_clip = get_fingerprint(video["path"])
+    if not fp_clip:
+        return []
+
+    # Pick the best event (respecting the hint just for event selection).
+    best_event_idx = None
+    best_score = -1.0
+    for j, event in enumerate(events):
+        fp_ref = event_fingerprints[j]
+        if not fp_ref:
+            continue
+        _, score = align_clip_to_event(video["path"], event, fp_ref, video, no_hint=no_hint)
+        if score > best_score:
+            best_score = score
+            best_event_idx = j
+
+    if best_event_idx is None:
+        return []
+
+    event = events[best_event_idx]
+    fp_ref = event_fingerprints[best_event_idx]
+
+    print(f"    Shotgun: full-scan top-{n} peaks of event {best_event_idx + 1}...")
+    peaks = correlate_fingerprints_topn(fp_ref, fp_clip, n, NMS_WINDOW_ITEMS)
+
+    candidates = []
+    for rank, (offset_items, score) in enumerate(peaks, start=1):
+        offset_secs = offset_items * FPCALC_ITEM_DURATION + ALIGNMENT_OFFSET_CORRECTION
+        candidates.append({
+            "video": video,
+            "clip_number": clip_num,
+            "event": event,
+            "offset": offset_secs,
+            "confidence": score,
+            "skipped": False,
+            "candidate": {
+                "rank": rank,
+                "raw_offset_items": offset_items,
+                "correction": ALIGNMENT_OFFSET_CORRECTION,
+            },
+        })
+    return candidates
+
+
+def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=None, it_is_what_it_is=False, no_hint=False, shotgun=None):
     """Align video clips to events. Returns list of alignment results."""
     # Fingerprint all events once upfront
     event_fingerprints = fingerprint_events(events)
@@ -371,6 +452,18 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
             continue
 
         print(f"\n  Clip {clip_num}: {os.path.basename(video['path'])} ({video['duration']:.1f}s)")
+
+        if shotgun:
+            candidates = shotgun_align_clip(
+                video, events, event_fingerprints, clip_num, shotgun, no_hint=no_hint)
+            if not candidates:
+                print(f"  {YELLOW}WARNING: Clip {clip_num} produced no shotgun candidates{RESET}")
+            else:
+                print(f"    {len(candidates)} candidate(s): " +
+                      ", ".join(f"#{c['candidate']['rank']} @ {c['offset']:.2f}s "
+                                f"(conf {c['confidence']:.3f})" for c in candidates))
+            alignments.extend(candidates)
+            continue
 
         # Try each event, pick best match
         best_offset = None
@@ -696,6 +789,18 @@ class ClipLogger:
         self.log_file.close()
 
 
+def candidate_suffix(alignment):
+    """Filename suffix distinguishing shotgun candidates.
+
+    Empty string for a normal (non-candidate) alignment, so default-mode
+    output, temp, and log filenames are unchanged.
+    """
+    cand = alignment.get("candidate")
+    if not cand:
+        return ""
+    return f"_cand{cand['rank']}_{alignment['offset']:.1f}s"
+
+
 def process_audio_for_clip(alignment, temp_dir, output_dir):
     """Phase 4: Cut, detect applause, attenuate impulses, peak normalize.
 
@@ -708,12 +813,18 @@ def process_audio_for_clip(alignment, temp_dir, output_dir):
     offset = alignment["offset"]
     clip_num = alignment["clip_number"]
     basename = os.path.basename(alignment["video"]["path"])
-    log_name = os.path.splitext(basename)[0] + ".log"
+    suffix = candidate_suffix(alignment)
+    log_name = os.path.splitext(basename)[0] + suffix + ".log"
     logger = ClipLogger(os.path.join(output_dir, log_name))
 
     print(f"\n  Clip {clip_num}: {basename}")
 
     logger.log(f"    Match found at offset {offset:.2f}s, confidence: {alignment['confidence']:.4f}")
+    if alignment.get("candidate"):
+        cand = alignment["candidate"]
+        logger.log(f"    Shotgun candidate #{cand['rank']} — "
+                   f"raw offset {cand['raw_offset_items']} items, "
+                   f"correction applied {cand['correction']:.2f}s")
 
     if offset < 0:
         logger.log(f"    {YELLOW}WARNING: Negative offset ({offset:.2f}s) — "
@@ -722,7 +833,7 @@ def process_audio_for_clip(alignment, temp_dir, output_dir):
 
     # Step 1: Cut the matching audio segment from the event.
     # We cut from individual segments to avoid >4GB WAV file issues.
-    cut_path = os.path.join(temp_dir, f"clip_{clip_num}_cut.wav")
+    cut_path = os.path.join(temp_dir, f"clip_{clip_num}{suffix}_cut.wav")
     segments = alignment["event"]["segments"]
     logger.log(f"    Cutting audio at offset {offset:.2f}s for {video_duration:.1f}s...")
 
@@ -741,7 +852,7 @@ def process_audio_for_clip(alignment, temp_dir, output_dir):
             continue
         # This segment contains (part of) the audio we need
         take_duration = min(remaining_duration, seg_dur - remaining_offset)
-        part_path = os.path.join(temp_dir, f"clip_{clip_num}_part_{part_idx}.wav")
+        part_path = os.path.join(temp_dir, f"clip_{clip_num}{suffix}_part_{part_idx}.wav")
         cmd = [
             "ffmpeg", "-y", "-i", seg["path"],
             "-ss", str(remaining_offset), "-t", str(take_duration),
@@ -827,7 +938,7 @@ def process_audio_for_clip(alignment, temp_dir, output_dir):
     logger.log(f"    Peak normalized (gain: {gain_db:+.1f} dB)")
 
     # Step 6: Write normalized audio to temp file
-    norm_path = os.path.join(temp_dir, f"clip_{clip_num}_normalized.wav")
+    norm_path = os.path.join(temp_dir, f"clip_{clip_num}{suffix}_normalized.wav")
     write_wav_from_float(norm_path, signal, sr, nch)
 
     logger.close()
@@ -842,7 +953,8 @@ def mux_clip(alignment, norm_path, output_dir, keep_original_audio=False):
     video_path = alignment["video"]["path"]
     clip_num = alignment["clip_number"]
     basename = os.path.basename(video_path)
-    output_path = os.path.join(output_dir, basename)
+    stem, ext = os.path.splitext(basename)
+    output_path = os.path.join(output_dir, stem + candidate_suffix(alignment) + ext)
 
     map_args = ["-map", "0:v", "-map", "1:a"]
     if keep_original_audio:
@@ -875,6 +987,13 @@ def parse_args(argv=None):
     parser.add_argument("--temp-dir", help="Directory for temporary files (default: system temp)")
     parser.add_argument("--no-hint", action="store_true", help="Skip metadata timestamp heuristic, always do full scan")
     parser.add_argument("--keep-original-audio", action="store_true", help="Keep original video audio as a second track (for verifying alignment)")
+    parser.add_argument(
+        "--shotgun",
+        type=int,
+        metavar="N",
+        help="Emit N candidate outputs per clip (different alignment offsets) "
+             "instead of auto-picking one. Use to recover from a bad match.",
+    )
     return parser.parse_args(argv)
 
 
@@ -882,6 +1001,10 @@ def main():
     args = parse_args()
     input_dir = args.input
     output_dir = args.output
+
+    if args.shotgun is not None and args.shotgun < 2:
+        print("Error: --shotgun N requires N >= 2.")
+        sys.exit(2)
 
     if not os.path.isdir(input_dir):
         print(f"Error: Input directory '{input_dir}' does not exist.")
@@ -935,6 +1058,7 @@ def main():
             from_clip=args.from_clip,
             it_is_what_it_is=args.it_is_what_it_is,
             no_hint=args.no_hint,
+            shotgun=args.shotgun,
         )
 
         # Phase 4: Process audio

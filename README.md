@@ -57,6 +57,7 @@ Place all raw audio recordings and video clips in a single input directory. Outp
 | `--it-is-what-it-is` | Include low-confidence matches instead of skipping them |
 | `--no-hint` | Skip metadata timestamp heuristic, always do full scan |
 | `--keep-original-audio` | Keep the original video audio as a second track |
+| `--shotgun N` | Emit N candidate outputs per clip (different alignment offsets) instead of auto-picking one; use to recover from a bad match. Output files are named `<clip>_cand<k>_<offset>s.<ext>`. |
 | `--temp-dir DIR` | Directory for temporary files (default: system temp) |
 
 ### Supported formats
