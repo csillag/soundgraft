@@ -60,12 +60,12 @@ def test_min_overlap_items_threaded_into_align_clip_to_event():
     captured = {}
 
     def fake_align_clip_to_event(video_path, event, fp_ref, video_meta,
-                                 no_hint=False, min_overlap_items=None):
+                                 no_hint=False, min_overlap_items=None, **kwargs):
         captured["min_overlap_items"] = min_overlap_items
         return (0, 0.9)
 
     def fake_shotgun_align_clip(video, events, event_fingerprints, clip_num, n,
-                                no_hint=False, min_overlap_items=None):
+                                no_hint=False, min_overlap_items=None, **kwargs):
         captured["shotgun_min_overlap_items"] = min_overlap_items
         return []
 
@@ -87,3 +87,14 @@ def test_min_overlap_items_threaded_into_align_clip_to_event():
             f"shotgun_align_clip got min_overlap_items={captured.get('shotgun_min_overlap_items')}, "
             f"expected {expected_items}"
         )
+
+
+def test_offset_correction_default():
+    from soundgraft.cli import ALIGNMENT_OFFSET_CORRECTION
+    args = parse_args(["--input", "in", "--output", "out"])
+    assert args.offset_correction == ALIGNMENT_OFFSET_CORRECTION
+
+
+def test_offset_correction_parsed():
+    args = parse_args(["--input", "in", "--output", "out", "--offset-correction", "-0.19"])
+    assert args.offset_correction == -0.19

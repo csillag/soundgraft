@@ -38,5 +38,5 @@
 ### Loudness Normalization Option
 - Current design uses peak normalization only (correct for music). A future flag could offer EBU R128 loudness normalization for speech/conference recordings where perceptual consistency matters more than preserving dynamics.
 
-### Offset-Correction Value (pending data)
-- `compute_overlap` applies `ALIGNMENT_OFFSET_CORRECTION` (0.5s) exactly once when converting a correlation lag to video time. The historical hinted-vs-full-scan double-apply asymmetry is gone. Whether 0.5s is the correct empirical value is still open; resolve by running a known-good clip and observing which offset syncs, then adjust the single constant.
+### Offset-Correction Value (empirically tuned to -0.19)
+- `compute_overlap` applies `ALIGNMENT_OFFSET_CORRECTION` (-0.19s) exactly once when converting a correlation lag to video time; the historical double-apply asymmetry is gone. Tuned from a `--keep-original-audio` measurement on clip S1330001: the replaced audio was 0.69s late at the old 0.5s. Lateness moves 1:1 with the constant, so 0.5 - 0.69 = -0.19. Override per-run with `--offset-correction SEC` (lower if audio plays late, raise if early); chromaprint's residual bias can vary slightly per source, so re-measure on a known-good clip if a batch looks off.

@@ -70,3 +70,18 @@ def test_classify_skip_reasons():
     assert classify_alignment_skip(0.10, overlap_dur=3.0, min_overlap_sec=10.0, it_is_what_it_is=True) == "below-min-overlap"
     # Good match: no skip.
     assert classify_alignment_skip(0.9, overlap_dur=30.0, min_overlap_sec=10.0, it_is_what_it_is=False) is None
+
+
+def test_default_correction_is_empirical_value():
+    # Empirically tuned: clip S1330001 measured 0.69s audio-late at the old 0.5,
+    # and lateness moves 1:1 with the correction -> 0.5 - 0.69 = -0.19.
+    from soundgraft.cli import ALIGNMENT_OFFSET_CORRECTION
+    assert ALIGNMENT_OFFSET_CORRECTION == -0.19
+
+
+def test_compute_overlap_explicit_correction_overrides_default():
+    from soundgraft.cli import ALIGNMENT_OFFSET_CORRECTION
+    base = compute_overlap(100, 30.0, 600.0)
+    custom = compute_overlap(100, 30.0, 600.0, correction=0.0)
+    diff = custom["audio_start_in_video"] - base["audio_start_in_video"]
+    assert abs(diff - (0.0 - ALIGNMENT_OFFSET_CORRECTION)) < 1e-9
