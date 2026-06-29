@@ -212,6 +212,11 @@ def timestamps_look_plausible(video_time, event_start_time):
 FPCALC_ITEM_DURATION = 0.1238  # seconds per fingerprint item (4096 / 11025 / 3)
 ALIGNMENT_OFFSET_CORRECTION = 0.5  # empirical correction for chromaprint alignment bias
 
+# Non-maximum suppression window (in fingerprint items) for top-N peak
+# extraction. ~16 items ≈ 2.0 s: small enough to keep a true peak a few
+# seconds from a spurious one, large enough to collapse one peak's shoulder.
+NMS_WINDOW_ITEMS = 16
+
 
 def get_fingerprint(filepath):
     """Get raw chromaprint fingerprint for an audio file using fpcalc.
@@ -234,17 +239,20 @@ def popcnt(x):
     return bin(x & 0xFFFFFFFF).count("1")
 
 
-def correlate_fingerprints(fp_ref, fp_clip, search_start=0, search_end=None):
-    """Slide fp_clip over fp_ref and find the offset with highest correlation.
+def correlate_fingerprints_topn(fp_ref, fp_clip, n, nms_window_items,
+                                search_start=0, search_end=None):
+    """Slide fp_clip over fp_ref and return the top-N correlation peaks.
 
-    Returns (best_offset_items, best_score) where best_offset_items is the
-    position in fp_ref where fp_clip best matches, and best_score is 0.0-1.0.
+    Returns a list of (offset_items, score) tuples sorted by score descending,
+    length <= n. Peaks are separated by non-maximum suppression: after each
+    pick, all positions within +/- nms_window_items are suppressed so the
+    next pick comes from a different peak rather than the same peak's shoulder.
     """
     clip_len = len(fp_clip)
     ref_len = len(fp_ref)
 
     if clip_len == 0 or ref_len == 0:
-        return 0, 0.0
+        return []
 
     if search_end is None:
         search_end = ref_len - clip_len
@@ -253,25 +261,45 @@ def correlate_fingerprints(fp_ref, fp_clip, search_start=0, search_end=None):
     search_start = max(0, search_start)
 
     if search_start >= search_end:
-        return 0, 0.0
+        return []
 
-    best_offset = 0
-    best_score = 0.0
-    total_positions = search_end - search_start
+    total_bits = 32 * clip_len
+    # Score array indexed by absolute offset; unscanned positions stay -1.0.
+    scores = np.full(search_end, -1.0)
 
     for offset in tqdm(range(search_start, search_end),
                        desc="    Aligning", unit="pos",
                        bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
         bit_errors = 0
-        total_bits = 32 * clip_len
         for i in range(clip_len):
             bit_errors += popcnt(fp_ref[offset + i] ^ fp_clip[i])
-        score = 1.0 - (bit_errors / total_bits)
-        if score > best_score:
-            best_score = score
-            best_offset = offset
+        scores[offset] = 1.0 - (bit_errors / total_bits)
 
-    return best_offset, best_score
+    results = []
+    work = scores.copy()
+    for _ in range(n):
+        idx = int(np.argmax(work))
+        if work[idx] < 0:
+            break
+        results.append((idx, float(scores[idx])))
+        lo = max(0, idx - nms_window_items)
+        hi = min(len(work), idx + nms_window_items + 1)
+        work[lo:hi] = -1.0
+
+    return results
+
+
+def correlate_fingerprints(fp_ref, fp_clip, search_start=0, search_end=None):
+    """Slide fp_clip over fp_ref and find the offset with highest correlation.
+
+    Returns (best_offset_items, best_score) where best_offset_items is the
+    position in fp_ref where fp_clip best matches, and best_score is 0.0-1.0.
+    """
+    peaks = correlate_fingerprints_topn(
+        fp_ref, fp_clip, 1, NMS_WINDOW_ITEMS, search_start, search_end)
+    if not peaks:
+        return 0, 0.0
+    return peaks[0]
 
 
 def fingerprint_events(events):
