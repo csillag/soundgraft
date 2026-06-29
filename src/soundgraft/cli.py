@@ -303,40 +303,46 @@ def popcnt(x):
 
 
 def correlate_fingerprints_topn(fp_ref, fp_clip, n, nms_window_items,
-                                search_start=0, search_end=None):
-    """Slide fp_clip over fp_ref and return the top-N correlation peaks.
+                                min_overlap_items, search_start=None, search_end=None):
+    """Cross-correlate fp_clip against fp_ref over all signed lags.
 
-    Returns a list of (offset_items, score) tuples sorted by score descending,
-    length <= n. Peaks are separated by non-maximum suppression: after each
-    pick, all positions within +/- nms_window_items are suppressed so the
-    next pick comes from a different peak rather than the same peak's shoulder.
+    A lag L is the index in fp_ref aligned with fp_clip[0]; L may be negative
+    (the clip leads). Each lag is scored on its overlapping items only:
+    1 - bit_errors / (32 * overlap). Lags whose overlap is below
+    min_overlap_items are excluded entirely. Returns up to n (lag, score)
+    peaks, descending score, separated by non-maximum suppression.
+
+    search_start / search_end, when given, are inclusive bounds on the lag.
     """
     clip_len = len(fp_clip)
     ref_len = len(fp_ref)
-
     if clip_len == 0 or ref_len == 0:
         return []
 
-    if search_end is None:
-        search_end = ref_len - clip_len
-
-    search_end = min(search_end, ref_len - clip_len)
-    search_start = max(0, search_start)
-
-    if search_end <= 0 or search_start >= search_end:
+    lo_lag = -(clip_len - 1)
+    hi_lag = ref_len - 1
+    if search_start is not None:
+        lo_lag = max(lo_lag, search_start)
+    if search_end is not None:
+        hi_lag = min(hi_lag, search_end)
+    if lo_lag > hi_lag:
         return []
 
-    total_bits = 32 * clip_len
-    # Score array indexed by absolute offset; unscanned positions stay -1.0.
-    scores = np.full(search_end, -1.0)
+    n_lags = hi_lag - lo_lag + 1
+    scores = np.full(n_lags, -1.0)
 
-    for offset in tqdm(range(search_start, search_end),
-                       desc="    Aligning", unit="pos",
-                       bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
+    for lag in tqdm(range(lo_lag, hi_lag + 1),
+                    desc="    Aligning", unit="lag",
+                    bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]"):
+        i_start = max(0, -lag)
+        i_end = min(clip_len, ref_len - lag)
+        overlap = i_end - i_start
+        if overlap < min_overlap_items:
+            continue
         bit_errors = 0
-        for i in range(clip_len):
-            bit_errors += popcnt(fp_ref[offset + i] ^ fp_clip[i])
-        scores[offset] = 1.0 - (bit_errors / total_bits)
+        for i in range(i_start, i_end):
+            bit_errors += popcnt(fp_ref[lag + i] ^ fp_clip[i])
+        scores[lag - lo_lag] = 1.0 - (bit_errors / (32 * overlap))
 
     results = []
     work = scores.copy()
@@ -344,7 +350,7 @@ def correlate_fingerprints_topn(fp_ref, fp_clip, n, nms_window_items,
         idx = int(np.argmax(work))
         if work[idx] < 0:
             break
-        results.append((idx, float(scores[idx])))
+        results.append((idx + lo_lag, float(scores[idx])))
         lo = max(0, idx - nms_window_items)
         hi = min(len(work), idx + nms_window_items + 1)
         work[lo:hi] = -1.0
@@ -352,14 +358,10 @@ def correlate_fingerprints_topn(fp_ref, fp_clip, n, nms_window_items,
     return results
 
 
-def correlate_fingerprints(fp_ref, fp_clip, search_start=0, search_end=None):
-    """Slide fp_clip over fp_ref and find the offset with highest correlation.
-
-    Returns (best_offset_items, best_score) where best_offset_items is the
-    position in fp_ref where fp_clip best matches, and best_score is 0.0-1.0.
-    """
+def correlate_fingerprints(fp_ref, fp_clip, min_overlap_items, search_start=None, search_end=None):
+    """Best single signed lag. Returns (lag, score), or (0, 0.0) if none."""
     peaks = correlate_fingerprints_topn(
-        fp_ref, fp_clip, 1, NMS_WINDOW_ITEMS, search_start, search_end)
+        fp_ref, fp_clip, 1, NMS_WINDOW_ITEMS, min_overlap_items, search_start, search_end)
     if not peaks:
         return 0, 0.0
     return peaks[0]
@@ -394,12 +396,16 @@ def fingerprint_events(events):
     return event_fingerprints
 
 
-def align_clip_to_event(video_path, event, fp_ref, video_meta, no_hint=False):
+def align_clip_to_event(video_path, event, fp_ref, video_meta, no_hint=False, min_overlap_items=None):
     """Align a video clip to an event using chromaprint fingerprint correlation.
 
-    fp_ref is the pre-computed fingerprint for the event.
-    Returns (offset_seconds, confidence_score) or (None, 0) on failure.
+    fp_ref is the pre-computed fingerprint for the event. Returns
+    (lag_items, score), where lag_items is the signed offset of the clip's
+    first item within the event audio. Returns (None, 0) on failure.
     """
+    if min_overlap_items is None:
+        min_overlap_items = effective_min_overlap_items(DEFAULT_MIN_OVERLAP_SEC)
+
     video_time = parse_timestamp(video_meta["creation_time"])
     event_start = parse_timestamp(event["start_time"])
 
@@ -413,39 +419,37 @@ def align_clip_to_event(video_path, event, fp_ref, video_meta, no_hint=False):
     print(f"    Reference: {len(fp_ref)} items ({len(fp_ref) * FPCALC_ITEM_DURATION:.0f}s), "
           f"Clip: {len(fp_clip)} items ({len(fp_clip) * FPCALC_ITEM_DURATION:.0f}s)")
 
-    # Try metadata-hinted search first
+    # Try metadata-hinted search first (expressed as a signed-lag window).
     if not no_hint and timestamps_look_plausible(video_time, event_start):
         offset_hint = (video_time - event_start).total_seconds()
-        # Search window: +/- 30 minutes around expected position
-        hint_start = int(max(0, offset_hint - 1800) / FPCALC_ITEM_DURATION)
-        hint_end = int((offset_hint + 1800 + video_meta["duration"]) / FPCALC_ITEM_DURATION)
+        hint_start = int((offset_hint - 1800) / FPCALC_ITEM_DURATION)
+        hint_end = int((offset_hint + 1800) / FPCALC_ITEM_DURATION)
 
         print(f"    Trying metadata-hinted window "
               f"({hint_start * FPCALC_ITEM_DURATION:.0f}s - {hint_end * FPCALC_ITEM_DURATION:.0f}s)...")
 
-        offset_items, score = correlate_fingerprints(fp_ref, fp_clip, hint_start, hint_end)
-        offset_secs = offset_items * FPCALC_ITEM_DURATION + ALIGNMENT_OFFSET_CORRECTION + ALIGNMENT_OFFSET_CORRECTION
+        lag_items, score = correlate_fingerprints(
+            fp_ref, fp_clip, min_overlap_items, hint_start, hint_end)
 
         if score >= CONFIDENCE_THRESHOLD:
-            print(f"    Match found! Offset: {offset_secs:.2f}s, confidence: {score:.4f}")
-            return offset_secs, score
+            print(f"    Match found! Lag: {lag_items} items, confidence: {score:.4f}")
+            return lag_items, score
         else:
             print(f"    Narrow search inconclusive (score: {score:.4f}), falling back to full scan...")
 
-    # Full scan
+    # Full scan over all signed lags.
     print(f"    Full scan of {len(fp_ref) * FPCALC_ITEM_DURATION:.0f}s event audio...")
-    offset_items, score = correlate_fingerprints(fp_ref, fp_clip)
-    offset_secs = offset_items * FPCALC_ITEM_DURATION + ALIGNMENT_OFFSET_CORRECTION
+    lag_items, score = correlate_fingerprints(fp_ref, fp_clip, min_overlap_items)
 
     if score >= CONFIDENCE_THRESHOLD:
-        print(f"    Match found! Offset: {offset_secs:.2f}s, confidence: {score:.4f}")
+        print(f"    Match found! Lag: {lag_items} items, confidence: {score:.4f}")
     else:
-        print(f"    Low confidence match. Offset: {offset_secs:.2f}s, confidence: {score:.4f}")
+        print(f"    Low confidence match. Lag: {lag_items} items, confidence: {score:.4f}")
 
-    return offset_secs, score
+    return lag_items, score
 
 
-def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=False):
+def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=False, min_overlap_items=None):
     """Build up to n candidate alignments for one clip (shotgun mode).
 
     Chooses the single best event using the normal per-event selection, then
@@ -454,6 +458,9 @@ def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=F
     is intentionally ignored for the peak survey — the hinted auto-pick is what
     produced the bad match in the first place.
     """
+    if min_overlap_items is None:
+        min_overlap_items = effective_min_overlap_items(DEFAULT_MIN_OVERLAP_SEC)
+
     fp_clip = get_fingerprint(video["path"])
     if not fp_clip:
         return []
@@ -465,7 +472,9 @@ def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=F
         fp_ref = event_fingerprints[j]
         if not fp_ref:
             continue
-        _, score = align_clip_to_event(video["path"], event, fp_ref, video, no_hint=no_hint)
+        _, score = align_clip_to_event(
+            video["path"], event, fp_ref, video, no_hint=no_hint,
+            min_overlap_items=min_overlap_items)
         if score > best_score:
             best_score = score
             best_event_idx = j
@@ -477,21 +486,22 @@ def shotgun_align_clip(video, events, event_fingerprints, clip_num, n, no_hint=F
     fp_ref = event_fingerprints[best_event_idx]
 
     print(f"    Shotgun: full-scan top-{n} peaks of event {best_event_idx + 1}...")
-    peaks = correlate_fingerprints_topn(fp_ref, fp_clip, n, NMS_WINDOW_ITEMS)
+    peaks = correlate_fingerprints_topn(
+        fp_ref, fp_clip, n, NMS_WINDOW_ITEMS, min_overlap_items)
 
     candidates = []
-    for rank, (offset_items, score) in enumerate(peaks, start=1):
-        offset_secs = offset_items * FPCALC_ITEM_DURATION + ALIGNMENT_OFFSET_CORRECTION
+    for rank, (lag_items, score) in enumerate(peaks, start=1):
+        geo = compute_overlap(lag_items, video["duration"], event["total_duration"])
         candidates.append({
             "video": video,
             "clip_number": clip_num,
             "event": event,
-            "offset": offset_secs,
+            "offset": geo["audio_start_in_video"],
             "confidence": score,
             "skipped": False,
             "candidate": {
                 "rank": rank,
-                "raw_offset_items": offset_items,
+                "raw_offset_items": lag_items,
                 "correction": ALIGNMENT_OFFSET_CORRECTION,
             },
         })
@@ -529,7 +539,7 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
             continue
 
         # Try each event, pick best match
-        best_offset = None
+        best_lag = None
         best_score = 0
         best_event = None
 
@@ -538,9 +548,9 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
             if not fp_ref:
                 continue
             print(f"    Trying event {j + 1} ({event['total_duration']:.0f}s)...")
-            offset, score = align_clip_to_event(video["path"], event, fp_ref, video, no_hint=no_hint)
+            lag, score = align_clip_to_event(video["path"], event, fp_ref, video, no_hint=no_hint)
             if score > best_score:
-                best_offset = offset
+                best_lag = lag
                 best_score = score
                 best_event = event
 
@@ -550,11 +560,16 @@ def align_all_clips(video_files, events, temp_dir, clip_filter=None, from_clip=N
             print(f"  \033[33mWARNING: Clip {clip_num} skipped — "
                   f"best confidence {best_score:.2f} below threshold {CONFIDENCE_THRESHOLD}\033[0m")
 
+        offset = None
+        if best_lag is not None and best_event is not None:
+            offset = compute_overlap(
+                best_lag, video["duration"], best_event["total_duration"])["audio_start_in_video"]
+
         alignments.append({
             "video": video,
             "clip_number": clip_num,
             "event": best_event,
-            "offset": best_offset,
+            "offset": offset,
             "confidence": best_score,
             "skipped": skipped,
         })

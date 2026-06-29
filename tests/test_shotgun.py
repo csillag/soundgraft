@@ -37,7 +37,7 @@ def test_shotgun_align_clip_returns_n_candidates():
     # always return the planted clip pattern.
     with patch("soundgraft.cli.get_fingerprint", return_value=_CLIP):
         candidates = shotgun_align_clip(
-            video, [event], [fp_ref], clip_num=1, n=2, no_hint=True)
+            video, [event], [fp_ref], clip_num=1, n=2, no_hint=True, min_overlap_items=2)
 
     assert len(candidates) == 2
     # Distinct offsets, ranked, candidate metadata present, never skipped.
@@ -51,3 +51,9 @@ def test_shotgun_align_clip_returns_n_candidates():
     # Raw offsets recorded for the correction experiment.
     raw = {c["candidate"]["raw_offset_items"] for c in candidates}
     assert raw == {5, 25}
+    from soundgraft.cli import compute_overlap
+    for c in candidates:
+        expected = compute_overlap(
+            c["candidate"]["raw_offset_items"], video["duration"], event["total_duration"]
+        )["audio_start_in_video"]
+        assert abs(c["offset"] - expected) < 1e-9
