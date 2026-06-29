@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -216,6 +217,68 @@ ALIGNMENT_OFFSET_CORRECTION = 0.5  # empirical correction for chromaprint alignm
 # extraction. ~16 items ≈ 2.0 s: small enough to keep a true peak a few
 # seconds from a spurious one, large enough to collapse one peak's shoulder.
 NMS_WINDOW_ITEMS = 16
+
+# Minimum fingerprint-item overlap for a lag to be considered a real match.
+# ~40 items ≈ 5 s. Prevents a tiny accidental overlap from scoring a
+# spuriously perfect bit-match and beating the true alignment.
+MIN_OVERLAP_ITEMS_HARD = 40
+
+# Default product floor for how much of a clip must be covered by audio to be
+# worth emitting (seconds). Overridable via --min-overlap.
+DEFAULT_MIN_OVERLAP_SEC = 10.0
+
+
+def effective_min_overlap_items(min_overlap_sec):
+    """Convert a min-overlap in seconds to fingerprint items, never below the
+    correlation-sanity hard floor."""
+    return max(MIN_OVERLAP_ITEMS_HARD,
+               math.ceil(min_overlap_sec / FPCALC_ITEM_DURATION))
+
+
+def compute_overlap(lag_items, video_dur, audio_dur):
+    """Geometry SSOT: turn a signed correlation lag into video-time overlap.
+
+    lag_items is the index in the audio fingerprint aligned with the clip's
+    first item (signed; negative means the video leads). Returns a dict:
+      audio_start_in_video : where the audio recording begins in video time
+                             (>0 = audio starts partway into the video)
+      ov_start, ov_end     : overlap span in video time
+      ov_dur               : ov_end - ov_start (<=0 means no overlap)
+      audio_cut_start      : offset into the audio recording for the overlap
+    The offset correction is applied here, exactly once.
+    """
+    audio_start_in_video = -lag_items * FPCALC_ITEM_DURATION + ALIGNMENT_OFFSET_CORRECTION
+    ov_start = max(0.0, audio_start_in_video)
+    ov_end = min(video_dur, audio_start_in_video + audio_dur)
+    ov_dur = ov_end - ov_start
+    audio_cut_start = ov_start - audio_start_in_video
+    return {
+        "audio_start_in_video": audio_start_in_video,
+        "ov_start": ov_start,
+        "ov_end": ov_end,
+        "ov_dur": ov_dur,
+        "audio_cut_start": audio_cut_start,
+    }
+
+
+def first_keyframe_at_or_after(keyframe_times, ov_start):
+    """Return the first keyframe timestamp >= ov_start, or None if none.
+    keyframe_times must be sorted ascending."""
+    for t in keyframe_times:
+        if t >= ov_start:
+            return t
+    return None
+
+
+def classify_alignment_skip(score, overlap_dur, min_overlap_sec, it_is_what_it_is):
+    """Return a skip reason string, or None to keep the clip.
+    Min-overlap is a hard product floor (not overridable by it_is_what_it_is);
+    low-confidence is overridable."""
+    if overlap_dur < min_overlap_sec:
+        return "below-min-overlap"
+    if score < CONFIDENCE_THRESHOLD and not it_is_what_it_is:
+        return "low-confidence"
+    return None
 
 
 def get_fingerprint(filepath):
