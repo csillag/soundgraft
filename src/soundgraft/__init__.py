@@ -1,3 +1,3 @@
 """SoundGraft — replace video audio with high-quality dedicated recordings."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
