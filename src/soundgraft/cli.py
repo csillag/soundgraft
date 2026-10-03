@@ -899,6 +899,13 @@ def candidate_suffix(alignment):
     return f"_cand{cand['rank']}_{alignment['offset']:.1f}s"
 
 
+def saved_audio_path(alignment, output_dir):
+    """Path of the standalone WAV written by --save-audio: the output video's
+    path with a .wav extension, so the two sit side by side."""
+    stem = os.path.splitext(os.path.basename(alignment["video"]["path"]))[0]
+    return os.path.join(output_dir, stem + candidate_suffix(alignment) + ".wav")
+
+
 def get_keyframe_times(video_path):
     """Return sorted keyframe presentation timestamps (seconds) for the video
     stream, using ffprobe. Empty list on failure."""
@@ -936,9 +943,14 @@ def parse_keyframe_times(stdout):
     return sorted(times)
 
 
-def process_audio_for_clip(alignment, temp_dir, output_dir, min_overlap_sec=DEFAULT_MIN_OVERLAP_SEC, no_cleanup=False):
+def process_audio_for_clip(alignment, temp_dir, output_dir, min_overlap_sec=DEFAULT_MIN_OVERLAP_SEC, no_cleanup=False,
+                           save_audio=False):
     """Phase 4: keyframe-snap the overlap, trim the video (copy, no re-encode),
     cut the matching audio, detect applause, attenuate impulses, peak normalize.
+
+    With save_audio, the normalized WAV is written to output_dir next to the
+    video (same stem and candidate suffix) instead of the temp dir, so it
+    survives the run.
 
     Returns (trimmed_video_path, normalized_wav_path, applause_blocks, impulses)
     or (None, None, [], []) if skipped.
@@ -1116,9 +1128,14 @@ def process_audio_for_clip(alignment, temp_dir, output_dir, min_overlap_sec=DEFA
     gain_db = 20 * np.log10(gain) if gain > 0 else 0
     logger.log(f"    Peak normalized (gain: {gain_db:+.1f} dB)")
 
-    # Step 6: Write normalized audio to temp file
-    norm_path = os.path.join(temp_dir, f"clip_{clip_num}{suffix}_normalized.wav")
+    # Step 6: Write normalized audio to temp file, or to the output dir if --save-audio
+    if save_audio:
+        norm_path = saved_audio_path(alignment, output_dir)
+    else:
+        norm_path = os.path.join(temp_dir, f"clip_{clip_num}{suffix}_normalized.wav")
     write_wav_from_float(norm_path, signal, sr, nch)
+    if save_audio:
+        logger.log(f"    Saved audio: {norm_path}")
 
     logger.close()
     return trimmed_video, norm_path, applause_blocks, impulses
@@ -1164,6 +1181,7 @@ def parse_args(argv=None):
     parser.add_argument("--no-hint", action="store_true", help="Skip metadata timestamp heuristic, always do full scan")
     parser.add_argument("--keep-original-audio", action="store_true", help="Keep original video audio as a second track (for verifying alignment)")
     parser.add_argument("--no-cleanup", action="store_true", help="Skip applause and impulse detection/attenuation (keeps peak normalization)")
+    parser.add_argument("--save-audio", action="store_true", help="Also save each clip's final audio as a standalone WAV next to its output video")
     parser.add_argument(
         "--shotgun",
         type=int,
@@ -1266,7 +1284,7 @@ def main():
         for alignment in alignments:
             trimmed_video, norm_path, applause_blocks, impulses = process_audio_for_clip(
                 alignment, temp_dir, output_dir, min_overlap_sec=args.min_overlap,
-                no_cleanup=args.no_cleanup)
+                no_cleanup=args.no_cleanup, save_audio=args.save_audio)
             clip_results.append((alignment, trimmed_video, norm_path))
 
         # Phase 5: Mux final videos

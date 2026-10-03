@@ -61,6 +61,7 @@ Place all raw audio recordings and video clips in a single input directory. Outp
 | `--min-overlap SEC` | Minimum seconds of audio/video overlap required to emit a clip (default: 10). Clips with less overlap are skipped. |
 | `--offset-correction SEC` | Seconds added to the chromaprint-derived audio offset to correct its fixed bias (default: -0.19). Lower it if the replaced audio plays late, raise it if early. |
 | `--no-cleanup` | Skip applause and impulse detection/attenuation (peak normalization still applied). |
+| `--save-audio` | Also save each clip's final audio (the exact audio muxed into the video, before the container's lossy encode) as a 16-bit PCM WAV next to the output video, named `<clip>.wav` (with the candidate suffix under `--shotgun`). |
 | `--temp-dir DIR` | Directory for temporary files (default: system temp) |
 
 ### Supported formats
