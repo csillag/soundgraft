@@ -4,7 +4,7 @@ from unittest.mock import patch, MagicMock
 
 from soundgraft.cli import (
     parse_args, DEFAULT_MIN_OVERLAP_SEC, align_all_clips,
-    effective_min_overlap_items,
+    effective_min_overlap_items, saved_audio_path,
 )
 
 
@@ -108,3 +108,24 @@ def test_no_cleanup_default_false():
 def test_no_cleanup_flag_sets_true():
     args = parse_args(["--input", "in", "--output", "out", "--no-cleanup"])
     assert args.no_cleanup is True
+
+
+def test_save_audio_default_false():
+    args = parse_args(["--input", "in", "--output", "out"])
+    assert args.save_audio is False
+
+
+def test_save_audio_flag_sets_true():
+    args = parse_args(["--input", "in", "--output", "out", "--save-audio"])
+    assert args.save_audio is True
+
+
+def test_saved_audio_path_sits_next_to_video():
+    alignment = {"video": {"path": "/in/S1330001.MP4"}, "offset": 12.3}
+    assert saved_audio_path(alignment, "/out") == "/out/S1330001.wav"
+
+
+def test_saved_audio_path_carries_candidate_suffix():
+    alignment = {"video": {"path": "/in/S1330001.MP4"}, "offset": 16.4,
+                 "candidate": {"rank": 2}}
+    assert saved_audio_path(alignment, "/out") == "/out/S1330001_cand2_16.4s.wav"
